@@ -1,0 +1,558 @@
+export const CAPTURE_RESULT_AVAILABLE_EVENT = 'screen-capture://result-available'
+export const CAPTURE_SESSION_ENDED_EVENT = 'screen-capture://session-ended'
+
+const MAX_RESULT_BYTES = 160 * 1024 * 1024
+const PNG_SIGNATURE = [137, 80, 78, 71, 13, 10, 26, 10] as const
+const NATIVE_PHASES = new Set(['waiting_for_overlay', 'hiding_origin', 'capturing', 'frame_available', 'awaiting_presentation', 'active', 'result_available', 'delivering', 'restoring'])
+
+export interface CaptureEvent<T> {
+  payload: T
+}
+
+export type CaptureUnlisten = () => void
+export type CaptureListen = (event: string, handler: (event: CaptureEvent<unknown>) => void | Promise<void>) => Promise<CaptureUnlisten>
+export type CaptureInvoke = (command: string, args?: Record<string, unknown>) => Promise<unknown>
+
+export interface CaptureResultDescriptor {
+  sessionId: string
+  resultId: string
+  width: number
+  height: number
+  filename: string
+  mimeType: string
+  byteLen: number
+}
+
+export interface CaptureResultAvailable {
+  targetToken: string
+  descriptor: CaptureResultDescriptor
+}
+
+export type CaptureSessionOutcome = 'cancelled' | 'saved' | 'copied' | 'failed' | 'completed'
+
+export interface CaptureSessionEnded {
+  sessionId: string
+  targetToken: string
+  outcome: CaptureSessionOutcome
+}
+
+export interface CaptureStartResponse {
+  sessionId: string
+  overlayGeneration: number
+  phase: string
+}
+
+export interface CaptureTarget {
+  windowLabel: string
+  targetToken: string
+}
+
+export type CaptureConsumer = (file: File) => Promise<void>
+
+export type CaptureClientErrorCode =
+  | 'acknowledgment_failed'
+  | 'capture_busy'
+  | 'consumer_failed'
+  | 'delivery_busy'
+  | 'disposed'
+  | 'invalid_result'
+  | 'invalid_start'
+  | 'lease_release_failed'
+  | 'target_unavailable'
+
+export class CaptureClientError extends Error {
+  readonly code: CaptureClientErrorCode
+  override readonly cause: unknown
+
+  constructor(code: CaptureClientErrorCode, message: string, cause?: unknown) {
+    super(message)
+    this.name = 'CaptureClientError'
+    this.code = code
+    this.cause = cause
+  }
+}
+
+export interface CaptureClientDependencies {
+  windowLabel: string
+  listen: CaptureListen
+  invoke: CaptureInvoke
+  createTargetToken?: () => string
+  onError?: (error: CaptureClientError) => void
+}
+
+export interface CaptureConsumerRegistration {
+  readonly targetToken: string | null
+  activate(): string
+  deactivate(): void
+  dispose(): void
+}
+
+export interface CaptureClient {
+  registerConsumer(consumer: CaptureConsumer): CaptureConsumerRegistration
+  activeTarget(): CaptureTarget | null
+  activeCapture(): { sessionId: string; targetToken: string } | null
+  startComposerCapture(): Promise<CaptureStartResponse>
+  dispose(): void
+}
+
+interface RegistrationState {
+  disposed: boolean
+  token: string | null
+  consumer: CaptureConsumer
+}
+
+interface FrozenTarget {
+  registration: RegistrationState
+  token: string
+  consumer: CaptureConsumer
+}
+
+interface ActiveSession {
+  sessionId: string
+  target: FrozenTarget
+}
+
+interface PendingAcknowledgment {
+  event: CaptureResultAvailable
+  args: ResultCommandArguments
+}
+
+interface ResultCommandArguments extends Record<string, unknown> {
+  sessionId: string
+  resultId: string
+  targetToken: string
+}
+
+function defaultTargetToken(): string {
+  const bytes = new Uint8Array(24)
+  globalThis.crypto.getRandomValues(bytes)
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('')
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null
+}
+
+function requireIdentifier(value: unknown, field: string): asserts value is string {
+  if (typeof value !== 'string' || value.length === 0 || value.length > 256 || value.trim() !== value) {
+    throw new CaptureClientError('invalid_result', `capture ${field} is invalid`)
+  }
+}
+
+function requirePositiveSafeInteger(value: unknown, field: string, maximum = Number.MAX_SAFE_INTEGER): asserts value is number {
+  if (!Number.isSafeInteger(value) || (value as number) <= 0 || (value as number) > maximum) {
+    throw new CaptureClientError('invalid_result', `capture ${field} is invalid`)
+  }
+}
+
+function validateStartResponse(value: unknown): CaptureStartResponse {
+  if (!isRecord(value)) throw new CaptureClientError('invalid_start', 'native capture start returned invalid metadata')
+  const { sessionId, overlayGeneration, phase } = value
+  try {
+    requireIdentifier(sessionId, 'session id')
+    requirePositiveSafeInteger(overlayGeneration, 'overlay generation')
+  } catch (error) {
+    throw new CaptureClientError('invalid_start', 'native capture start returned invalid metadata', error)
+  }
+  if (typeof phase !== 'string' || !NATIVE_PHASES.has(phase)) {
+    throw new CaptureClientError('invalid_start', 'native capture start returned an invalid phase')
+  }
+  return { sessionId, overlayGeneration, phase }
+}
+
+function validateResultEvent(value: unknown): CaptureResultAvailable {
+  if (!isRecord(value)) throw new CaptureClientError('invalid_result', 'capture result event is invalid')
+  requireIdentifier(value.targetToken, 'target token')
+  if (!isRecord(value.descriptor)) throw new CaptureClientError('invalid_result', 'capture result descriptor is invalid')
+  const descriptor = value.descriptor
+  requireIdentifier(descriptor.sessionId, 'session id')
+  requireIdentifier(descriptor.resultId, 'result id')
+  requirePositiveSafeInteger(descriptor.width, 'width')
+  requirePositiveSafeInteger(descriptor.height, 'height')
+  requirePositiveSafeInteger(descriptor.byteLen, 'byte length', MAX_RESULT_BYTES)
+  if (
+    typeof descriptor.filename !== 'string' ||
+    descriptor.filename.length === 0 ||
+    descriptor.filename.length > 255 ||
+    descriptor.filename === '.' ||
+    descriptor.filename === '..' ||
+    /[\\/\0]/.test(descriptor.filename) ||
+    !descriptor.filename.toLowerCase().endsWith('.png')
+  ) {
+    throw new CaptureClientError('invalid_result', 'capture filename is invalid')
+  }
+  if (descriptor.mimeType !== 'image/png') {
+    throw new CaptureClientError('invalid_result', 'capture result must use image/png')
+  }
+  return {
+    targetToken: value.targetToken,
+    descriptor: {
+      sessionId: descriptor.sessionId,
+      resultId: descriptor.resultId,
+      width: descriptor.width,
+      height: descriptor.height,
+      filename: descriptor.filename,
+      mimeType: descriptor.mimeType,
+      byteLen: descriptor.byteLen,
+    },
+  }
+}
+
+function validateSessionEnded(value: unknown): CaptureSessionEnded {
+  if (!isRecord(value)) throw new CaptureClientError('invalid_result', 'capture terminal event is invalid')
+  requireIdentifier(value.sessionId, 'session id')
+  requireIdentifier(value.targetToken, 'target token')
+  if (!['cancelled', 'saved', 'copied', 'failed', 'completed'].includes(value.outcome as string)) {
+    throw new CaptureClientError('invalid_result', 'capture terminal outcome is invalid')
+  }
+  return {
+    sessionId: value.sessionId,
+    targetToken: value.targetToken,
+    outcome: value.outcome as CaptureSessionOutcome,
+  }
+}
+
+function validatePngBytes(value: unknown, descriptor: CaptureResultDescriptor): ArrayBuffer {
+  if (!(value instanceof ArrayBuffer)) {
+    throw new CaptureClientError('invalid_result', 'capture result did not use binary IPC')
+  }
+  if (value.byteLength !== descriptor.byteLen) {
+    throw new CaptureClientError('invalid_result', 'capture result byte length does not match its descriptor')
+  }
+  const bytes = new Uint8Array(value)
+  if (PNG_SIGNATURE.some((byte, index) => bytes[index] !== byte)) {
+    throw new CaptureClientError('invalid_result', 'capture result does not have a PNG signature')
+  }
+  return value
+}
+
+function asClientError(error: unknown, code: CaptureClientErrorCode, message: string): CaptureClientError {
+  return error instanceof CaptureClientError ? error : new CaptureClientError(code, message, error)
+}
+
+class CaptureClientImpl implements CaptureClient {
+  private readonly deps: Required<Pick<CaptureClientDependencies, 'createTargetToken'>> & CaptureClientDependencies
+  private activeRegistration: RegistrationState | null = null
+  private startingTarget: FrozenTarget | null = null
+  private session: ActiveSession | null = null
+  private queuedResults: CaptureResultAvailable[] = []
+  private queuedTerminals: CaptureSessionEnded[] = []
+  private pendingAcknowledgment: PendingAcknowledgment | null = null
+  private listenerPromise: Promise<void> | null = null
+  private unlisteners: CaptureUnlisten[] = []
+  private delivering = false
+  private disposed = false
+
+  constructor(deps: CaptureClientDependencies) {
+    if (!deps.windowLabel.trim()) throw new CaptureClientError('target_unavailable', 'capture webview label is required')
+    this.deps = { ...deps, createTargetToken: deps.createTargetToken ?? defaultTargetToken }
+  }
+
+  registerConsumer(consumer: CaptureConsumer): CaptureConsumerRegistration {
+    this.requireLive()
+    const registration: RegistrationState = { consumer, disposed: false, token: null }
+    return {
+      get targetToken() {
+        return registration.token
+      },
+      activate: () => {
+        this.requireLive()
+        if (registration.disposed) throw new CaptureClientError('target_unavailable', 'capture consumer was disposed')
+        const token = this.deps.createTargetToken()
+        requireIdentifier(token, 'target token')
+        registration.token = token
+        this.activeRegistration = registration
+        return token
+      },
+      deactivate: () => {
+        if (this.activeRegistration === registration) this.activeRegistration = null
+        registration.token = null
+      },
+      dispose: () => {
+        if (this.activeRegistration === registration) this.activeRegistration = null
+        registration.token = null
+        registration.disposed = true
+      },
+    }
+  }
+
+  activeTarget(): CaptureTarget | null {
+    const registration = this.activeRegistration
+    if (!registration?.token || registration.disposed) return null
+    return { windowLabel: this.deps.windowLabel, targetToken: registration.token }
+  }
+
+  activeCapture(): { sessionId: string; targetToken: string } | null {
+    return this.session ? { sessionId: this.session.sessionId, targetToken: this.session.target.token } : null
+  }
+
+  async startComposerCapture(): Promise<CaptureStartResponse> {
+    this.requireLive()
+    if (this.startingTarget || this.session) {
+      throw new CaptureClientError('capture_busy', 'this webview already owns a capture session')
+    }
+    const registration = this.activeRegistration
+    if (!registration?.token || registration.disposed) {
+      throw new CaptureClientError('target_unavailable', 'open a chat before starting a composer capture')
+    }
+    const frozen: FrozenTarget = {
+      registration,
+      token: registration.token,
+      consumer: registration.consumer,
+    }
+    this.startingTarget = frozen
+    try {
+      await this.ensureListening()
+      const response = validateStartResponse(
+        await this.deps.invoke('screen_capture_start', {
+          targetWindowLabel: this.deps.windowLabel,
+          targetToken: frozen.token,
+        })
+      )
+      this.session = { sessionId: response.sessionId, target: frozen }
+      this.startingTarget = null
+      const terminals = this.queuedTerminals.splice(0)
+      const queued = this.queuedResults.splice(0)
+      for (const terminal of terminals) this.dispatchSessionEnded(terminal)
+      for (const result of queued) void this.dispatchResult(result)
+      return response
+    } catch (error) {
+      this.startingTarget = null
+      this.queuedResults = []
+      this.queuedTerminals = []
+      throw asClientError(error, 'invalid_start', 'could not start screen capture')
+    }
+  }
+
+  dispose(): void {
+    if (this.disposed) return
+    this.disposed = true
+    this.activeRegistration = null
+    this.startingTarget = null
+    this.session = null
+    this.queuedResults = []
+    this.queuedTerminals = []
+    this.pendingAcknowledgment = null
+    for (const unlisten of this.unlisteners.splice(0)) unlisten()
+  }
+
+  private requireLive(): void {
+    if (this.disposed) throw new CaptureClientError('disposed', 'capture client has been disposed')
+  }
+
+  private frozenTargetIsActive(target: FrozenTarget): boolean {
+    return this.activeRegistration === target.registration && !target.registration.disposed && target.registration.token === target.token
+  }
+
+  private async ensureListening(): Promise<void> {
+    if (!this.listenerPromise) {
+      this.listenerPromise = (async () => {
+        const installed: CaptureUnlisten[] = []
+        try {
+          installed.push(await this.deps.listen(CAPTURE_RESULT_AVAILABLE_EVENT, ({ payload }) => this.onResult(payload)))
+          installed.push(await this.deps.listen(CAPTURE_SESSION_ENDED_EVENT, ({ payload }) => this.onSessionEnded(payload)))
+          if (this.disposed) {
+            for (const unlisten of installed) unlisten()
+          } else {
+            this.unlisteners.push(...installed)
+          }
+        } catch (error) {
+          for (const unlisten of installed) unlisten()
+          this.listenerPromise = null
+          throw error
+        }
+      })()
+    }
+    await this.listenerPromise
+  }
+
+  private async onResult(payload: unknown): Promise<void> {
+    if (this.disposed) return
+    let result: CaptureResultAvailable
+    try {
+      result = validateResultEvent(payload)
+    } catch (error) {
+      this.report(asClientError(error, 'invalid_result', 'capture result metadata is invalid'))
+      return
+    }
+    if (!this.session && this.startingTarget) {
+      if (result.targetToken !== this.startingTarget.token) {
+        this.report(new CaptureClientError('target_unavailable', 'capture result belongs to another target'))
+        return
+      }
+      this.queuedResults.push(result)
+      return
+    }
+    await this.dispatchResult(result)
+  }
+
+  private onSessionEnded(payload: unknown): void {
+    if (this.disposed) return
+    let terminal: CaptureSessionEnded
+    try {
+      terminal = validateSessionEnded(payload)
+    } catch (error) {
+      this.report(asClientError(error, 'invalid_result', 'capture terminal metadata is invalid'))
+      return
+    }
+    if (!this.session && this.startingTarget) {
+      if (terminal.targetToken !== this.startingTarget.token) {
+        this.report(new CaptureClientError('target_unavailable', 'capture terminal event belongs to another target'))
+        return
+      }
+      this.queuedTerminals.push(terminal)
+      return
+    }
+    this.dispatchSessionEnded(terminal)
+  }
+
+  private dispatchSessionEnded(terminal: CaptureSessionEnded): void {
+    const session = this.session
+    // ACK may resolve before its best-effort native completion event arrives.
+    // With no locally owned session there is no state for a late event to clear.
+    if (!session) return
+    if (terminal.sessionId !== session.sessionId) {
+      this.report(new CaptureClientError('invalid_result', 'capture terminal event belongs to another session'))
+      return
+    }
+    if (terminal.targetToken !== session.target.token) {
+      this.report(new CaptureClientError('target_unavailable', 'capture terminal event belongs to another target'))
+      return
+    }
+    this.session = null
+    this.pendingAcknowledgment = null
+  }
+
+  private async dispatchResult(result: CaptureResultAvailable): Promise<void> {
+    if (this.disposed) return
+    try {
+      await this.deliverResult(result)
+    } catch (error) {
+      this.report(asClientError(error, 'invalid_result', 'capture result delivery failed'))
+    }
+  }
+
+  private async deliverResult(result: CaptureResultAvailable): Promise<void> {
+    const session = this.session
+    if (!session || result.descriptor.sessionId !== session.sessionId) {
+      throw new CaptureClientError('invalid_result', 'capture result belongs to another session')
+    }
+    if (result.targetToken !== session.target.token) {
+      throw new CaptureClientError('target_unavailable', 'capture result belongs to another target')
+    }
+    if (this.delivering) throw new CaptureClientError('delivery_busy', 'capture result delivery is already in progress')
+
+    const args: ResultCommandArguments = {
+      sessionId: result.descriptor.sessionId,
+      resultId: result.descriptor.resultId,
+      targetToken: result.targetToken,
+    }
+    if (this.pendingAcknowledgment) {
+      if (!this.sameResult(this.pendingAcknowledgment.event, result)) {
+        throw new CaptureClientError('invalid_result', 'capture acknowledgment belongs to another result')
+      }
+      await this.acknowledge(this.pendingAcknowledgment)
+      return
+    }
+    if (!this.frozenTargetIsActive(session.target)) {
+      throw new CaptureClientError('target_unavailable', 'the frozen capture target is no longer active')
+    }
+
+    this.delivering = true
+    let leaseAcquired = false
+    try {
+      const raw = await this.deps.invoke('screen_capture_take_result', args)
+      leaseAcquired = true
+      // Terminal cleanup is authoritative. Native may finish cancellation
+      // while its already-started raw response is crossing IPC.
+      if (this.session !== session) {
+        leaseAcquired = false
+        return
+      }
+      const bytes = validatePngBytes(raw, result.descriptor)
+      if (!this.frozenTargetIsActive(session.target)) {
+        throw new CaptureClientError('target_unavailable', 'the frozen capture target is no longer active')
+      }
+      const file = new File([bytes], result.descriptor.filename, { type: result.descriptor.mimeType })
+      try {
+        await session.target.consumer(file)
+      } catch (error) {
+        throw new CaptureClientError('consumer_failed', 'the capture consumer rejected the PNG', error)
+      }
+      leaseAcquired = false
+      const pending = { event: result, args }
+      if (this.session === session) this.pendingAcknowledgment = pending
+      await this.acknowledge(pending)
+    } catch (error) {
+      if (leaseAcquired) await this.release(args, error)
+      throw error
+    } finally {
+      this.delivering = false
+    }
+  }
+
+  private async acknowledge(pending: PendingAcknowledgment): Promise<void> {
+    let lastError: unknown
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        await this.deps.invoke('screen_capture_ack_result', pending.args)
+        if (this.pendingAcknowledgment === pending) this.pendingAcknowledgment = null
+        if (this.session?.sessionId === pending.args.sessionId) this.session = null
+        return
+      } catch (error) {
+        lastError = error
+        // Native terminal cleanup may race the IPC response. It has already
+        // made the bounded result unavailable, so a late rejection is inert.
+        if (this.pendingAcknowledgment !== pending || this.session?.sessionId !== pending.args.sessionId) return
+      }
+    }
+    throw new CaptureClientError('acknowledgment_failed', 'capture was consumed but could not be acknowledged', lastError)
+  }
+
+  private async release(args: ResultCommandArguments, deliveryError: unknown): Promise<void> {
+    try {
+      await this.deps.invoke('screen_capture_release_result', args)
+    } catch (error) {
+      throw new CaptureClientError('lease_release_failed', 'capture delivery failed and its lease could not be released', {
+        deliveryError,
+        releaseError: error,
+      })
+    }
+  }
+
+  private sameResult(left: CaptureResultAvailable, right: CaptureResultAvailable): boolean {
+    return (
+      left.targetToken === right.targetToken &&
+      left.descriptor.sessionId === right.descriptor.sessionId &&
+      left.descriptor.resultId === right.descriptor.resultId &&
+      left.descriptor.width === right.descriptor.width &&
+      left.descriptor.height === right.descriptor.height &&
+      left.descriptor.filename === right.descriptor.filename &&
+      left.descriptor.mimeType === right.descriptor.mimeType &&
+      left.descriptor.byteLen === right.descriptor.byteLen
+    )
+  }
+
+  private report(error: CaptureClientError): void {
+    try {
+      this.deps.onError?.(error)
+    } catch {
+      // Error reporting must never turn a native event into an unhandled rejection.
+    }
+  }
+}
+
+export function createCaptureClient(deps: CaptureClientDependencies): CaptureClient {
+  return new CaptureClientImpl(deps)
+}
+
+let webviewCaptureClient: CaptureClient | null = null
+
+/** Install once in a webview bootstrap; subsequent callers share the same client. */
+export function getCaptureClient(deps?: CaptureClientDependencies): CaptureClient {
+  if (!webviewCaptureClient) {
+    if (!deps) throw new CaptureClientError('target_unavailable', 'capture client has not been installed in this webview')
+    webviewCaptureClient = createCaptureClient(deps)
+  }
+  return webviewCaptureClient
+}
