@@ -210,6 +210,7 @@ describe('CaptureClient target ownership', () => {
     await vi.waitFor(() => {
       expect(test.errors.at(-1)).toMatchObject({ code: 'target_invalidation_failed', cause: failure })
     })
+    expect(test.invoke.mock.calls.filter(([command]) => command === 'screen_capture_invalidate_target')).toHaveLength(2)
   })
 
   it('invalidates after native supplies the session ID when deactivation races capture start', async () => {
@@ -325,6 +326,36 @@ describe('CaptureClient target ownership', () => {
 
     expect(test.invoke.mock.calls.some(([command]) => command === 'screen_capture_invalidate_target')).toBe(false)
     expect(test.client.activeCapture()).toBeNull()
+  })
+
+  it('clears local busy state after native confirms target invalidation', async () => {
+    const test = await startedHarness()
+
+    test.registration.deactivate()
+    await vi.waitFor(() => expect(test.client.activeCapture()).toBeNull())
+
+    test.registration.activate()
+    await expect(test.client.startComposerCapture()).resolves.toMatchObject({ sessionId: 'session-1' })
+  })
+
+  it('retries idempotent target invalidation before leaving the session busy', async () => {
+    let invalidationAttempts = 0
+    const test = harness({
+      invoke: vi.fn(async (command: string) => {
+        if (command === 'screen_capture_start') return { sessionId: 'session-1', overlayGeneration: 7, phase: 'active' }
+        if (command === 'screen_capture_invalidate_target' && invalidationAttempts++ === 0) throw new Error('response interrupted')
+        return undefined
+      }),
+    })
+    const registration = test.client.registerConsumer(async () => undefined)
+    registration.activate()
+    await test.client.startComposerCapture()
+
+    registration.deactivate()
+    await vi.waitFor(() => expect(test.client.activeCapture()).toBeNull())
+
+    expect(test.invoke.mock.calls.filter(([command]) => command === 'screen_capture_invalidate_target')).toHaveLength(2)
+    expect(test.errors).toEqual([])
   })
 
   it('does not resurrect a session when terminal cleanup races an in-flight invalidation', async () => {
@@ -498,7 +529,7 @@ describe('CaptureClient result delivery', () => {
     expect(test.errors.at(-1)).toMatchObject({ code: 'target_unavailable' })
   })
 
-  it('releases a lease without calling either consumer if the frozen target deactivates during the raw read', async () => {
+  it('does not deliver or release after native target invalidation wins an in-flight raw read', async () => {
     const bytes = deferred<unknown>()
     const consumer = vi.fn(async (_file: File) => undefined)
     const test = harness({
@@ -518,8 +549,8 @@ describe('CaptureClient result delivery', () => {
     await delivery
 
     expect(consumer).not.toHaveBeenCalled()
-    expect(test.invoke).toHaveBeenLastCalledWith('screen_capture_release_result', expect.any(Object))
-    expect(test.errors.at(-1)).toMatchObject({ code: 'target_unavailable' })
+    expect(test.invoke.mock.calls.some(([command]) => command === 'screen_capture_release_result')).toBe(false)
+    expect(test.errors).toEqual([])
   })
 
   it('serializes duplicate result events so the consumer and native lease are acquired once', async () => {

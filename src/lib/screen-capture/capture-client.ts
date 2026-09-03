@@ -360,9 +360,27 @@ class CaptureClientImpl implements CaptureClient {
       sessionId: session.sessionId,
       targetToken: session.target.token,
     }
-    void this.deps.invoke('screen_capture_invalidate_target', args).catch((error) => {
-      this.report(new CaptureClientError('target_invalidation_failed', 'native capture target could not be invalidated', error))
-    })
+    void this.completeTargetInvalidation(session, args)
+  }
+
+  private async completeTargetInvalidation(session: ActiveSession, args: { sessionId: string; targetToken: string }): Promise<void> {
+    let lastError: unknown
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        await this.deps.invoke('screen_capture_invalidate_target', args)
+        if (this.session === session) {
+          this.session = null
+          this.pendingAcknowledgment = null
+        }
+        return
+      } catch (error) {
+        lastError = error
+        // A matching terminal event may have completed the same cleanup while
+        // the invalidation response was in flight. Never affect a later session.
+        if (this.session !== session) return
+      }
+    }
+    this.report(new CaptureClientError('target_invalidation_failed', 'native capture target could not be invalidated', lastError))
   }
 
   private async ensureListening(): Promise<void> {
