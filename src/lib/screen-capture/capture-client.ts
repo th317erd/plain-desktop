@@ -58,6 +58,7 @@ export type CaptureClientErrorCode =
   | 'invalid_result'
   | 'invalid_start'
   | 'lease_release_failed'
+  | 'target_invalidation_failed'
   | 'target_unavailable'
 
 export class CaptureClientError extends Error {
@@ -110,6 +111,7 @@ interface FrozenTarget {
 interface ActiveSession {
   sessionId: string
   target: FrozenTarget
+  targetInvalidated: boolean
 }
 
 interface PendingAcknowledgment {
@@ -258,6 +260,7 @@ class CaptureClientImpl implements CaptureClient {
       activate: () => {
         this.requireLive()
         if (registration.disposed) throw new CaptureClientError('target_unavailable', 'capture consumer was disposed')
+        if (this.activeRegistration) this.invalidateFrozenTarget(this.activeRegistration)
         const token = this.deps.createTargetToken()
         requireIdentifier(token, 'target token')
         registration.token = token
@@ -265,10 +268,12 @@ class CaptureClientImpl implements CaptureClient {
         return token
       },
       deactivate: () => {
+        this.invalidateFrozenTarget(registration)
         if (this.activeRegistration === registration) this.activeRegistration = null
         registration.token = null
       },
       dispose: () => {
+        this.invalidateFrozenTarget(registration)
         if (this.activeRegistration === registration) this.activeRegistration = null
         registration.token = null
         registration.disposed = true
@@ -309,11 +314,14 @@ class CaptureClientImpl implements CaptureClient {
           targetToken: frozen.token,
         })
       )
-      this.session = { sessionId: response.sessionId, target: frozen }
+      this.session = { sessionId: response.sessionId, target: frozen, targetInvalidated: false }
       this.startingTarget = null
       const terminals = this.queuedTerminals.splice(0)
       const queued = this.queuedResults.splice(0)
       for (const terminal of terminals) this.dispatchSessionEnded(terminal)
+      if (this.session?.sessionId === response.sessionId && !this.frozenTargetIsActive(frozen)) {
+        this.invalidateFrozenTarget(frozen.registration)
+      }
       for (const result of queued) void this.dispatchResult(result)
       return response
     } catch (error) {
@@ -342,6 +350,19 @@ class CaptureClientImpl implements CaptureClient {
 
   private frozenTargetIsActive(target: FrozenTarget): boolean {
     return this.activeRegistration === target.registration && !target.registration.disposed && target.registration.token === target.token
+  }
+
+  private invalidateFrozenTarget(registration: RegistrationState): void {
+    const session = this.session
+    if (!session || session.target.registration !== registration || session.targetInvalidated) return
+    session.targetInvalidated = true
+    const args = {
+      sessionId: session.sessionId,
+      targetToken: session.target.token,
+    }
+    void this.deps.invoke('screen_capture_invalidate_target', args).catch((error) => {
+      this.report(new CaptureClientError('target_invalidation_failed', 'native capture target could not be invalidated', error))
+    })
   }
 
   private async ensureListening(): Promise<void> {

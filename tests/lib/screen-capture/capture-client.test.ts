@@ -132,6 +132,110 @@ describe('CaptureClient target ownership', () => {
     expect(test.client.activeTarget()).toEqual({ windowLabel: 'main', targetToken: 'target-2' })
   })
 
+  it.each(['deactivate', 'dispose'] as const)('invalidates the frozen native target when its registration calls %s', async (method) => {
+    const test = harness()
+    const registration = test.client.registerConsumer(async () => undefined)
+    registration.activate()
+    await test.client.startComposerCapture()
+
+    expect(() => registration[method]()).not.toThrow()
+    await vi.waitFor(() => {
+      expect(test.invoke).toHaveBeenCalledWith('screen_capture_invalidate_target', {
+        sessionId: 'session-1',
+        targetToken: 'target-1',
+      })
+    })
+  })
+
+  it('invalidates once when another cached chat activates and never redirects the frozen session', async () => {
+    const first = vi.fn(async (_file: File) => undefined)
+    const second = vi.fn(async (_file: File) => undefined)
+    const test = harness()
+    const firstRegistration = test.client.registerConsumer(first)
+    firstRegistration.activate()
+    await test.client.startComposerCapture()
+    const secondRegistration = test.client.registerConsumer(second)
+
+    secondRegistration.activate()
+    firstRegistration.deactivate()
+    firstRegistration.dispose()
+    await vi.waitFor(() => {
+      expect(test.invoke.mock.calls.filter(([command]) => command === 'screen_capture_invalidate_target')).toHaveLength(1)
+    })
+    await test.onResult()({ payload: resultAvailable() })
+
+    expect(test.invoke).toHaveBeenCalledWith('screen_capture_invalidate_target', {
+      sessionId: 'session-1',
+      targetToken: 'target-1',
+    })
+    expect(first).not.toHaveBeenCalled()
+    expect(second).not.toHaveBeenCalled()
+    expect(test.invoke.mock.calls.some(([command]) => command === 'screen_capture_take_result')).toBe(false)
+  })
+
+  it('does not invalidate for an unrelated registration or when no session exists', async () => {
+    const test = harness()
+    const owner = test.client.registerConsumer(async () => undefined)
+    const unrelated = test.client.registerConsumer(async () => undefined)
+
+    owner.activate()
+    owner.deactivate()
+    unrelated.deactivate()
+    unrelated.dispose()
+    expect(test.invoke).not.toHaveBeenCalled()
+
+    owner.activate()
+    await test.client.startComposerCapture()
+    unrelated.deactivate()
+    unrelated.dispose()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    expect(test.invoke.mock.calls.some(([command]) => command === 'screen_capture_invalidate_target')).toBe(false)
+  })
+
+  it('reports asynchronous native invalidation failure without throwing from registration lifecycle', async () => {
+    const failure = new Error('native target update failed')
+    const test = harness({
+      invoke: vi.fn(async (command: string) => {
+        if (command === 'screen_capture_start') return { sessionId: 'session-1', overlayGeneration: 7, phase: 'active' }
+        if (command === 'screen_capture_invalidate_target') throw failure
+        return undefined
+      }),
+    })
+    const registration = test.client.registerConsumer(async () => undefined)
+    registration.activate()
+    await test.client.startComposerCapture()
+
+    expect(() => registration.deactivate()).not.toThrow()
+    await vi.waitFor(() => {
+      expect(test.errors.at(-1)).toMatchObject({ code: 'target_invalidation_failed', cause: failure })
+    })
+  })
+
+  it('invalidates after native supplies the session ID when deactivation races capture start', async () => {
+    const nativeStart = deferred<unknown>()
+    const test = harness({
+      invoke: vi.fn(async (command: string) => {
+        if (command === 'screen_capture_start') return nativeStart.promise
+        return undefined
+      }),
+    })
+    const registration = test.client.registerConsumer(async () => undefined)
+    registration.activate()
+
+    const starting = test.client.startComposerCapture()
+    registration.deactivate()
+    expect(test.invoke.mock.calls.some(([command]) => command === 'screen_capture_invalidate_target')).toBe(false)
+    nativeStart.resolve({ sessionId: 'session-1', overlayGeneration: 7, phase: 'awaiting_presentation' })
+    await starting
+    await vi.waitFor(() => {
+      expect(test.invoke).toHaveBeenCalledWith('screen_capture_invalidate_target', {
+        sessionId: 'session-1',
+        targetToken: 'target-1',
+      })
+    })
+  })
+
   it('rejects duplicate capture starts in the same webview', async () => {
     const nativeStart = deferred<unknown>()
     const test = harness({
@@ -210,6 +314,39 @@ describe('CaptureClient target ownership', () => {
 
     expect(test.client.activeCapture()).toBeNull()
     await expect(test.client.startComposerCapture()).resolves.toMatchObject({ sessionId: 'session-1' })
+  })
+
+  it('does not invalidate after terminal cleanup already won the deactivation race', async () => {
+    const test = await startedHarness()
+
+    await test.onEnded()({ payload: { sessionId: 'session-1', targetToken: 'target-1', outcome: 'cancelled' } })
+    test.registration.deactivate()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    expect(test.invoke.mock.calls.some(([command]) => command === 'screen_capture_invalidate_target')).toBe(false)
+    expect(test.client.activeCapture()).toBeNull()
+  })
+
+  it('does not resurrect a session when terminal cleanup races an in-flight invalidation', async () => {
+    const invalidation = deferred<unknown>()
+    const test = harness({
+      invoke: vi.fn(async (command: string) => {
+        if (command === 'screen_capture_start') return { sessionId: 'session-1', overlayGeneration: 7, phase: 'active' }
+        if (command === 'screen_capture_invalidate_target') return invalidation.promise
+        return undefined
+      }),
+    })
+    const registration = test.client.registerConsumer(async () => undefined)
+    registration.activate()
+    await test.client.startComposerCapture()
+
+    registration.deactivate()
+    await test.onEnded()({ payload: { sessionId: 'session-1', targetToken: 'target-1', outcome: 'failed' } })
+    invalidation.resolve(undefined)
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    expect(test.invoke.mock.calls.filter(([command]) => command === 'screen_capture_invalidate_target')).toHaveLength(1)
+    expect(test.client.activeCapture()).toBeNull()
   })
 
   it.each([
