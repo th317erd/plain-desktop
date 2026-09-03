@@ -1,9 +1,11 @@
 export const CAPTURE_RESULT_AVAILABLE_EVENT = 'screen-capture://result-available'
+export const CAPTURE_SESSION_STARTED_EVENT = 'screen-capture://session-started'
 export const CAPTURE_SESSION_ENDED_EVENT = 'screen-capture://session-ended'
 
 const MAX_RESULT_BYTES = 160 * 1024 * 1024
 const PNG_SIGNATURE = [137, 80, 78, 71, 13, 10, 26, 10] as const
 const NATIVE_PHASES = new Set(['waiting_for_overlay', 'hiding_origin', 'capturing', 'frame_available', 'awaiting_presentation', 'active', 'result_available', 'delivering', 'restoring'])
+const ACK_RETRY_DELAYS_MS = [50, 200, 1000] as const
 
 export interface CaptureEvent<T> {
   payload: T
@@ -36,6 +38,11 @@ export interface CaptureSessionEnded {
   outcome: CaptureSessionOutcome
 }
 
+export interface CaptureSessionStarted {
+  sessionId: string
+  targetToken: string
+}
+
 export interface CaptureStartResponse {
   sessionId: string
   overlayGeneration: number
@@ -58,7 +65,9 @@ export type CaptureClientErrorCode =
   | 'invalid_result'
   | 'invalid_start'
   | 'lease_release_failed'
+  | 'target_registration_failed'
   | 'target_invalidation_failed'
+  | 'target_unregistration_failed'
   | 'target_unavailable'
 
 export class CaptureClientError extends Error {
@@ -78,6 +87,7 @@ export interface CaptureClientDependencies {
   listen: CaptureListen
   invoke: CaptureInvoke
   createTargetToken?: () => string
+  delay?: (milliseconds: number) => Promise<void>
   onError?: (error: CaptureClientError) => void
 }
 
@@ -112,6 +122,8 @@ interface ActiveSession {
   sessionId: string
   target: FrozenTarget
   targetInvalidated: boolean
+  deliveryCommitted: boolean
+  invalidationRequested: boolean
 }
 
 interface PendingAcknowledgment {
@@ -125,10 +137,20 @@ interface ResultCommandArguments extends Record<string, unknown> {
   targetToken: string
 }
 
+interface TargetRegistryMutation {
+  command: 'screen_capture_register_target' | 'screen_capture_unregister_target'
+  targetToken: string
+  errorCode: 'target_registration_failed' | 'target_unregistration_failed'
+}
+
 function defaultTargetToken(): string {
   const bytes = new Uint8Array(24)
   globalThis.crypto.getRandomValues(bytes)
   return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('')
+}
+
+function defaultDelay(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => globalThis.setTimeout(resolve, milliseconds))
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -214,6 +236,13 @@ function validateSessionEnded(value: unknown): CaptureSessionEnded {
   }
 }
 
+function validateSessionStarted(value: unknown): CaptureSessionStarted {
+  if (!isRecord(value)) throw new CaptureClientError('invalid_start', 'capture session event is invalid')
+  requireIdentifier(value.sessionId, 'session id')
+  requireIdentifier(value.targetToken, 'target token')
+  return { sessionId: value.sessionId, targetToken: value.targetToken }
+}
+
 function validatePngBytes(value: unknown, descriptor: CaptureResultDescriptor): ArrayBuffer {
   if (!(value instanceof ArrayBuffer)) {
     throw new CaptureClientError('invalid_result', 'capture result did not use binary IPC')
@@ -233,7 +262,7 @@ function asClientError(error: unknown, code: CaptureClientErrorCode, message: st
 }
 
 class CaptureClientImpl implements CaptureClient {
-  private readonly deps: Required<Pick<CaptureClientDependencies, 'createTargetToken'>> & CaptureClientDependencies
+  private readonly deps: Required<Pick<CaptureClientDependencies, 'createTargetToken' | 'delay'>> & CaptureClientDependencies
   private activeRegistration: RegistrationState | null = null
   private startingTarget: FrozenTarget | null = null
   private session: ActiveSession | null = null
@@ -242,12 +271,18 @@ class CaptureClientImpl implements CaptureClient {
   private pendingAcknowledgment: PendingAcknowledgment | null = null
   private listenerPromise: Promise<void> | null = null
   private unlisteners: CaptureUnlisten[] = []
+  private targetRegistryMutations: TargetRegistryMutation[] = []
+  private processingTargetRegistryMutations = false
   private delivering = false
   private disposed = false
 
   constructor(deps: CaptureClientDependencies) {
     if (!deps.windowLabel.trim()) throw new CaptureClientError('target_unavailable', 'capture webview label is required')
-    this.deps = { ...deps, createTargetToken: deps.createTargetToken ?? defaultTargetToken }
+    this.deps = {
+      ...deps,
+      createTargetToken: deps.createTargetToken ?? defaultTargetToken,
+      delay: deps.delay ?? defaultDelay,
+    }
   }
 
   registerConsumer(consumer: CaptureConsumer): CaptureConsumerRegistration {
@@ -260,23 +295,23 @@ class CaptureClientImpl implements CaptureClient {
       activate: () => {
         this.requireLive()
         if (registration.disposed) throw new CaptureClientError('target_unavailable', 'capture consumer was disposed')
-        if (this.activeRegistration) this.invalidateFrozenTarget(this.activeRegistration)
+        if (this.activeRegistration) this.deactivateRegistration(this.activeRegistration, false)
         const token = this.deps.createTargetToken()
         requireIdentifier(token, 'target token')
         registration.token = token
         this.activeRegistration = registration
+        this.enqueueTargetRegistryMutation({
+          command: 'screen_capture_register_target',
+          targetToken: token,
+          errorCode: 'target_registration_failed',
+        })
         return token
       },
       deactivate: () => {
-        this.invalidateFrozenTarget(registration)
-        if (this.activeRegistration === registration) this.activeRegistration = null
-        registration.token = null
+        this.deactivateRegistration(registration, false)
       },
       dispose: () => {
-        this.invalidateFrozenTarget(registration)
-        if (this.activeRegistration === registration) this.activeRegistration = null
-        registration.token = null
-        registration.disposed = true
+        this.deactivateRegistration(registration, true)
       },
     }
   }
@@ -314,7 +349,13 @@ class CaptureClientImpl implements CaptureClient {
           targetToken: frozen.token,
         })
       )
-      this.session = { sessionId: response.sessionId, target: frozen, targetInvalidated: false }
+      this.session = {
+        sessionId: response.sessionId,
+        target: frozen,
+        targetInvalidated: false,
+        deliveryCommitted: false,
+        invalidationRequested: false,
+      }
       this.startingTarget = null
       const terminals = this.queuedTerminals.splice(0)
       const queued = this.queuedResults.splice(0)
@@ -334,13 +375,13 @@ class CaptureClientImpl implements CaptureClient {
 
   dispose(): void {
     if (this.disposed) return
+    if (this.activeRegistration) this.deactivateRegistration(this.activeRegistration, true)
     this.disposed = true
-    this.activeRegistration = null
     this.startingTarget = null
-    this.session = null
+    if (!this.session?.deliveryCommitted) this.session = null
     this.queuedResults = []
     this.queuedTerminals = []
-    this.pendingAcknowledgment = null
+    if (!this.session?.deliveryCommitted) this.pendingAcknowledgment = null
     for (const unlisten of this.unlisteners.splice(0)) unlisten()
   }
 
@@ -352,9 +393,62 @@ class CaptureClientImpl implements CaptureClient {
     return this.activeRegistration === target.registration && !target.registration.disposed && target.registration.token === target.token
   }
 
+  private deactivateRegistration(registration: RegistrationState, dispose: boolean): void {
+    if (registration.disposed) return
+    this.invalidateFrozenTarget(registration)
+    const token = registration.token
+    if (this.activeRegistration === registration) this.activeRegistration = null
+    registration.token = null
+    registration.disposed = dispose
+    if (token) {
+      this.enqueueTargetRegistryMutation({
+        command: 'screen_capture_unregister_target',
+        targetToken: token,
+        errorCode: 'target_unregistration_failed',
+      })
+    }
+  }
+
+  private enqueueTargetRegistryMutation(mutation: TargetRegistryMutation): void {
+    this.targetRegistryMutations.push(mutation)
+    if (!this.processingTargetRegistryMutations) void this.processTargetRegistryMutations()
+  }
+
+  private async processTargetRegistryMutations(): Promise<void> {
+    this.processingTargetRegistryMutations = true
+    while (this.targetRegistryMutations.length > 0) {
+      const mutation = this.targetRegistryMutations.shift()
+      if (!mutation) break
+      let lastError: unknown
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        try {
+          if (mutation.command === 'screen_capture_register_target') await this.ensureListening()
+          await this.deps.invoke(mutation.command, { targetToken: mutation.targetToken })
+          lastError = undefined
+          break
+        } catch (error) {
+          lastError = error
+        }
+      }
+      if (lastError) {
+        this.report(new CaptureClientError(mutation.errorCode, 'native capture target registry could not be updated', lastError))
+      }
+    }
+    this.processingTargetRegistryMutations = false
+  }
+
   private invalidateFrozenTarget(registration: RegistrationState): void {
     const session = this.session
     if (!session || session.target.registration !== registration || session.targetInvalidated) return
+    if (session.deliveryCommitted) {
+      session.invalidationRequested = true
+      return
+    }
+    this.beginTargetInvalidation(session)
+  }
+
+  private beginTargetInvalidation(session: ActiveSession): void {
+    if (session.targetInvalidated) return
     session.targetInvalidated = true
     const args = {
       sessionId: session.sessionId,
@@ -377,7 +471,7 @@ class CaptureClientImpl implements CaptureClient {
         lastError = error
         // A matching terminal event may have completed the same cleanup while
         // the invalidation response was in flight. Never affect a later session.
-        if (this.session !== session) return
+        if (this.session !== session && !this.disposed) return
       }
     }
     this.report(new CaptureClientError('target_invalidation_failed', 'native capture target could not be invalidated', lastError))
@@ -390,6 +484,7 @@ class CaptureClientImpl implements CaptureClient {
         try {
           installed.push(await this.deps.listen(CAPTURE_RESULT_AVAILABLE_EVENT, ({ payload }) => this.onResult(payload)))
           installed.push(await this.deps.listen(CAPTURE_SESSION_ENDED_EVENT, ({ payload }) => this.onSessionEnded(payload)))
+          installed.push(await this.deps.listen(CAPTURE_SESSION_STARTED_EVENT, ({ payload }) => this.onSessionStarted(payload)))
           if (this.disposed) {
             for (const unlisten of installed) unlisten()
           } else {
@@ -423,6 +518,57 @@ class CaptureClientImpl implements CaptureClient {
       return
     }
     await this.dispatchResult(result)
+  }
+
+  private onSessionStarted(payload: unknown): void {
+    if (this.disposed) return
+    let started: CaptureSessionStarted
+    try {
+      started = validateSessionStarted(payload)
+    } catch (error) {
+      this.report(asClientError(error, 'invalid_start', 'capture session metadata is invalid'))
+      return
+    }
+
+    const registration = this.activeRegistration
+    if (!registration?.token || registration.disposed || registration.token !== started.targetToken) {
+      this.report(new CaptureClientError('target_unavailable', 'global capture belongs to an inactive target'))
+      void this.invalidateUnadoptedTarget(started)
+      return
+    }
+    if (this.session) {
+      if (this.session.sessionId === started.sessionId && this.session.target.token === started.targetToken) return
+      this.report(new CaptureClientError('capture_busy', 'another capture session is already active in this webview'))
+      void this.invalidateUnadoptedTarget(started)
+      return
+    }
+    this.session = {
+      sessionId: started.sessionId,
+      target: {
+        registration,
+        token: registration.token,
+        consumer: registration.consumer,
+      },
+      targetInvalidated: false,
+      deliveryCommitted: false,
+      invalidationRequested: false,
+    }
+  }
+
+  private async invalidateUnadoptedTarget(started: CaptureSessionStarted): Promise<void> {
+    let lastError: unknown
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        await this.deps.invoke('screen_capture_invalidate_target', {
+          sessionId: started.sessionId,
+          targetToken: started.targetToken,
+        })
+        return
+      } catch (error) {
+        lastError = error
+      }
+    }
+    this.report(new CaptureClientError('target_invalidation_failed', 'inactive global capture target could not be invalidated', lastError))
   }
 
   private onSessionEnded(payload: unknown): void {
@@ -498,14 +644,17 @@ class CaptureClientImpl implements CaptureClient {
     }
 
     this.delivering = true
-    let leaseAcquired = false
+    let resultTakeStarted = false
     try {
+      // The invoke response can be lost after native code has acquired the
+      // lease. Treat every started take as ambiguous until it is either
+      // aborted or handed to the acknowledgment path.
+      resultTakeStarted = true
       const raw = await this.deps.invoke('screen_capture_take_result', args)
-      leaseAcquired = true
       // Terminal cleanup is authoritative. Native may finish cancellation
       // while its already-started raw response is crossing IPC.
       if (this.session !== session) {
-        leaseAcquired = false
+        resultTakeStarted = false
         return
       }
       const bytes = validatePngBytes(raw, result.descriptor)
@@ -513,26 +662,38 @@ class CaptureClientImpl implements CaptureClient {
         throw new CaptureClientError('target_unavailable', 'the frozen capture target is no longer active')
       }
       const file = new File([bytes], result.descriptor.filename, { type: result.descriptor.mimeType })
+      // Crossing into the async consumer is the delivery commit boundary. Its
+      // destination was frozen at capture start, so route deactivation must
+      // not clear native authority while upload/send is already in flight.
+      session.deliveryCommitted = true
       try {
         await session.target.consumer(file)
       } catch (error) {
         throw new CaptureClientError('consumer_failed', 'the capture consumer rejected the PNG', error)
       }
-      leaseAcquired = false
+      resultTakeStarted = false
       const pending = { event: result, args }
       if (this.session === session) this.pendingAcknowledgment = pending
       await this.acknowledge(pending)
     } catch (error) {
-      if (leaseAcquired) await this.release(args, error)
+      if (resultTakeStarted && this.session === session) await this.release(args, error)
       throw error
     } finally {
+      session.deliveryCommitted = false
       this.delivering = false
+      if (this.session === session && session.invalidationRequested) {
+        this.beginTargetInvalidation(session)
+      }
     }
   }
 
   private async acknowledge(pending: PendingAcknowledgment): Promise<void> {
     let lastError: unknown
-    for (let attempt = 0; attempt < 2; attempt += 1) {
+    for (let attempt = 0; attempt <= ACK_RETRY_DELAYS_MS.length; attempt += 1) {
+      if (attempt > 0) {
+        await this.deps.delay(ACK_RETRY_DELAYS_MS[attempt - 1])
+        if (this.pendingAcknowledgment !== pending || this.session?.sessionId !== pending.args.sessionId) return
+      }
       try {
         await this.deps.invoke('screen_capture_ack_result', pending.args)
         if (this.pendingAcknowledgment === pending) this.pendingAcknowledgment = null

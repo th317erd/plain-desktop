@@ -1,16 +1,17 @@
 import { computed, ref } from 'vue'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { IUploadItem } from '@/stores/temp'
 
 const mocks = vi.hoisted(() => ({
   enqueue: vi.fn(),
+  cancel: vi.fn(),
   getUploads: vi.fn(),
   scrollBottom: vi.fn(),
 }))
 
 vi.mock('vue-i18n', () => ({ useI18n: () => ({ t: (key: string) => key }) }))
 vi.mock('@/hooks/upload', () => ({ useChatFilesUpload: () => ({ getUploads: mocks.getUploads }) }))
-vi.mock('@/views/chat/hooks/chat', () => ({ useTasks: () => ({ enqueue: mocks.enqueue }) }))
+vi.mock('@/views/chat/hooks/chat', () => ({ useTasks: () => ({ enqueue: mocks.enqueue, cancel: mocks.cancel }) }))
 vi.mock('@/lib/file', () => ({
   getImageData: vi.fn(async () => ({ width: 320, height: 200 })),
   getVideoData: vi.fn(),
@@ -23,7 +24,9 @@ import { snapshotChatUploadDestination, useChatUpload } from '@/views/chat/hooks
 describe('captured image upload destination', () => {
   beforeEach(() => {
     vi.clearAllMocks()
-    mocks.enqueue.mockResolvedValue(undefined)
+    mocks.enqueue.mockImplementation(async (item: any, _uploads: IUploadItem[], _toId: string, onSent?: (item: any) => void) => {
+      onSent?.({ ...item, id: `sent-${item.id}` })
+    })
     mocks.getUploads.mockImplementation((dir: string, files: File[]): IUploadItem[] =>
       files.map((file, index) => ({
         id: `upload-${index}`,
@@ -36,6 +39,10 @@ describe('captured image upload destination', () => {
         error: '',
       }))
     )
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
   })
 
   it('uses one immutable destination for storage, optimistic metadata, and enqueue after route changes', async () => {
@@ -64,7 +71,7 @@ describe('captured image upload destination', () => {
     expect(mocks.getUploads).toHaveBeenCalledWith('/captured/app', [expect.any(File)])
     expect(chatItems.value[0]).toMatchObject({ toId: 'peer:first', channelId: '' })
     expect(chatItems.value[0]._content.value.items[0]).toMatchObject({ dir: '/captured/app' })
-    expect(mocks.enqueue).toHaveBeenCalledWith(chatItems.value[0], expect.any(Array), 'peer:first', expect.any(Function))
+    expect(mocks.enqueue).toHaveBeenCalledWith(expect.objectContaining({ id: expect.stringMatching(/^new_/) }), expect.any(Array), 'peer:first', expect.any(Function))
   })
 
   it('keeps the existing image caller by snapshotting current values at invocation', async () => {
@@ -83,5 +90,48 @@ describe('captured image upload destination', () => {
 
     expect(mocks.getUploads).toHaveBeenCalledWith('/live/app', [expect.any(File)])
     expect(mocks.enqueue.mock.calls[0][2]).toBe('peer:current')
+  })
+
+  it('does not acknowledge capture consumption when upload queue acceptance fails', async () => {
+    const revokeUrl = vi.spyOn(URL, 'revokeObjectURL')
+    const chatItems = ref<any[]>([])
+    const upload = useChatUpload(
+      computed(() => 'peer:recipient'),
+      computed(() => ''),
+      '/captured/app',
+      mocks.scrollBottom,
+      ref(''),
+      chatItems
+    )
+    mocks.enqueue.mockRejectedValueOnce(new Error('upload queue unavailable'))
+
+    await expect(upload.doUploadImages([new File(['png'], 'capture.png', { type: 'image/png' })])).rejects.toThrow('upload queue unavailable')
+    expect(chatItems.value).toEqual([])
+    expect(revokeUrl).toHaveBeenCalledOnce()
+  })
+
+  it('revokes every optimistic capture URL and clears sending state across 100 completed cycles', async () => {
+    let created = 0
+    const createUrl = vi.spyOn(URL, 'createObjectURL').mockImplementation(() => `blob:capture-${created++}`)
+    const revokeUrl = vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined)
+    const chatItems = ref<any[]>([])
+    const upload = useChatUpload(
+      computed(() => 'peer:recipient'),
+      computed(() => ''),
+      '/captured/app',
+      mocks.scrollBottom,
+      ref(''),
+      chatItems
+    )
+
+    for (let index = 0; index < 100; index += 1) {
+      await upload.doUploadImages([new File([`png-${index}`], `capture-${index}.png`, { type: 'image/png' })])
+      const tempId = mocks.enqueue.mock.calls[index][0].id as string
+      expect(upload.sendingText(tempId)).toBe('sending')
+    }
+
+    expect(createUrl).toHaveBeenCalledTimes(100)
+    expect(revokeUrl.mock.calls.map(([url]) => url)).toEqual(Array.from({ length: 100 }, (_, index) => `blob:capture-${index}`))
+    expect(chatItems.value).toHaveLength(100)
   })
 })

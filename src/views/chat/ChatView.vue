@@ -37,7 +37,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onActivated, onDeactivated, onUnmounted } from 'vue'
+import { ref, computed, onActivated, onDeactivated, onUnmounted, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { formatDate } from '@/lib/format'
 import ChatInput from './ChatInput.vue'
@@ -104,13 +104,20 @@ function showCaptureError() {
 async function loadCaptureTarget(): Promise<ChatCaptureTarget> {
   if (!__IS_TAURI__) throw new Error('screen capture is available only in the desktop app')
   if (!captureTargetPromise) {
-    captureTargetPromise = import('@/lib/screen-capture/tauri-capture-adapter').then(async (adapter) => {
-      const client = await adapter.getTauriCaptureClient(() => showCaptureError())
-      const target = adapter.createChatCaptureTarget(client, (file, destination) => doUploadImages([file], destination))
-      captureTarget = target
-      if (captureDisposed) target.dispose()
-      return target
-    })
+    captureTargetPromise = import('@/lib/screen-capture/tauri-capture-adapter')
+      .then(async (adapter) => {
+        const client = await adapter.getTauriCaptureClient(() => showCaptureError())
+        const target = adapter.createChatCaptureTarget(client, (file, destination) => doUploadImages([file], destination))
+        captureTarget = target
+        if (captureDisposed) target.dispose()
+        return target
+      })
+      .catch((error) => {
+        // A transient listener/import failure must be retryable without
+        // reloading the whole chat webview.
+        captureTargetPromise = null
+        throw error
+      })
   }
   return captureTargetPromise
 }
@@ -118,10 +125,10 @@ async function loadCaptureTarget(): Promise<ChatCaptureTarget> {
 async function activateCaptureTarget(activation: number) {
   try {
     const target = await loadCaptureTarget()
-    if (captureDisposed || !isActive.value || activation !== captureActivation) return
+    if (captureDisposed || !isActive.value || notAllowChat.value || activation !== captureActivation) return
     target.activate(currentCaptureDestination())
   } catch {
-    if (!captureDisposed && isActive.value && activation === captureActivation) showCaptureError()
+    if (!captureDisposed && isActive.value && !notAllowChat.value && activation === captureActivation) showCaptureError()
   }
 }
 
@@ -129,10 +136,10 @@ async function handleCaptureRequest() {
   const activation = captureActivation
   try {
     const target = await loadCaptureTarget()
-    if (captureDisposed || !isActive.value || activation !== captureActivation) return
+    if (captureDisposed || !isActive.value || notAllowChat.value || activation !== captureActivation) return
     await target.start(currentCaptureDestination())
   } catch {
-    if (!captureDisposed && isActive.value && activation === captureActivation) showCaptureError()
+    if (!captureDisposed && isActive.value && !notAllowChat.value && activation === captureActivation) showCaptureError()
   }
 }
 
@@ -162,12 +169,19 @@ function handleForward(item: IChatItem) {
 onActivated(() => {
   isActive.value = true
   captureActivation += 1
-  if (__IS_TAURI__) void activateCaptureTarget(captureActivation)
+  if (__IS_TAURI__ && !notAllowChat.value) void activateCaptureTarget(captureActivation)
 })
 onDeactivated(() => {
   isActive.value = false
   captureActivation += 1
   captureTarget?.deactivate()
+})
+watch([chatId, channelId, notAllowChat], () => {
+  captureActivation += 1
+  captureTarget?.deactivate()
+  if (__IS_TAURI__ && isActive.value && !notAllowChat.value) {
+    void activateCaptureTarget(captureActivation)
+  }
 })
 onUnmounted(() => {
   captureDisposed = true

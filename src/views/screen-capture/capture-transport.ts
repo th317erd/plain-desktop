@@ -115,28 +115,31 @@ export async function createCaptureTransport(deps: CaptureTransportDependencies)
   requirePositiveInteger(deps.overlayGeneration, 'overlay generation')
   let disposed = false
   let processingSessionId: string | null = null
+  const reportFailure = async (sessionId: string, code: string, detail: string): Promise<void> => {
+    try {
+      await deps.invoke('screen_capture_fail', {
+        sessionId,
+        overlayGeneration: deps.overlayGeneration,
+        code,
+        detail,
+      })
+    } catch {
+      // Native/window teardown may already have won. Tauri event handlers must
+      // never leak a second rejection into the webview event bridge.
+    }
+  }
 
   const unlisten = await deps.listen(FRAME_AVAILABLE_EVENT, async ({ payload }) => {
     if (disposed) return
     if (processingSessionId) {
-      await deps.invoke('screen_capture_fail', {
-        sessionId: payload.sessionId,
-        overlayGeneration: deps.overlayGeneration,
-        code: 'overlay_busy',
-        detail: 'the capture overlay is already presenting another frame',
-      })
+      await reportFailure(payload.sessionId, 'overlay_busy', 'the capture overlay is already presenting another frame')
       return
     }
 
     processingSessionId = payload.sessionId
     try {
       if (payload.overlayGeneration !== deps.overlayGeneration) {
-        await deps.invoke('screen_capture_fail', {
-          sessionId: payload.sessionId,
-          overlayGeneration: deps.overlayGeneration,
-          code: 'stale_overlay_generation',
-          detail: 'capture frame belongs to another overlay generation',
-        })
+        await reportFailure(payload.sessionId, 'stale_overlay_generation', 'capture frame belongs to another overlay generation')
         return
       }
       if (typeof payload.canConfirm !== 'boolean') throw new Error('capture target metadata is invalid')
@@ -155,12 +158,7 @@ export async function createCaptureTransport(deps: CaptureTransportDependencies)
         overlayGeneration: deps.overlayGeneration,
       })
     } catch (error) {
-      await deps.invoke('screen_capture_fail', {
-        sessionId: payload.sessionId,
-        overlayGeneration: deps.overlayGeneration,
-        code: 'frame_decode_failed',
-        detail: errorDetail(error),
-      })
+      await reportFailure(payload.sessionId, 'frame_decode_failed', errorDetail(error))
     } finally {
       processingSessionId = null
     }

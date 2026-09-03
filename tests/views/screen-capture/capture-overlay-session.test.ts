@@ -61,6 +61,15 @@ function harness() {
   }
 }
 
+const PNG_BYTES = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10, 1, 2, 3, 4])
+
+function exportPayload() {
+  return {
+    png: new Blob([PNG_BYTES], { type: 'image/png' }),
+    selection: { x: 0, y: 0, width: 2, height: 2 },
+  }
+}
+
 describe('CaptureOverlaySession', () => {
   it('mounts frozen pixels synchronously without waiting on a hidden-window animation frame', async () => {
     const test = harness()
@@ -104,6 +113,35 @@ describe('CaptureOverlaySession', () => {
       sessionId: 'session-1',
       overlayGeneration: 7,
     })
+  })
+
+  it('keeps confirm pending until the target acknowledges native completion', async () => {
+    const test = harness()
+    await test.session.present(new ImageData(2, 2), frame())
+    let settled = false
+
+    const sending = test.mounts[0]!.options.onExport('confirm', exportPayload()).then(() => {
+      settled = true
+    })
+    await vi.waitFor(() => expect(test.invoke).toHaveBeenCalledWith('screen_capture_send_result', expect.any(Object)))
+    await Promise.resolve()
+    expect(settled).toBe(false)
+
+    test.session.sessionEnded({ sessionId: 'session-1', overlayGeneration: 7, outcome: 'completed' })
+    await expect(sending).resolves.toBeUndefined()
+    expect(settled).toBe(true)
+  })
+
+  it('rejects a pending confirm when native reports a retryable delivery failure', async () => {
+    const test = harness()
+    await test.session.present(new ImageData(2, 2), frame())
+
+    const sending = test.mounts[0]!.options.onExport('confirm', exportPayload())
+    await vi.waitFor(() => expect(test.invoke).toHaveBeenCalledWith('screen_capture_send_result', expect.any(Object)))
+    test.session.deliveryFailed({ sessionId: 'session-1', overlayGeneration: 7 })
+
+    await expect(sending).rejects.toThrow(/delivery failed/i)
+    expect(test.mounts[0]!.dispose).not.toHaveBeenCalled()
   })
 
   it('unmounts and clears frontend pixel ownership on a matching terminal event only', async () => {

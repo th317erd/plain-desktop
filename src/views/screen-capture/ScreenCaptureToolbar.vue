@@ -130,7 +130,7 @@ const tools = computed<ReadonlyArray<{ id: CaptureAnnotationTool; label: string;
   { id: 'mosaic', label: props.messages.tools.mosaic, icon: '▦' },
 ])
 
-const colors = ['#ef4444', '#f97316', '#eab308', '#22c55e', '#3b82f6'] as const
+const colors = ['#ef4444', '#eab308', '#22c55e', '#3b82f6', '#000000'] as const
 const strokeWidths = [2, 4, 8] as const
 
 function colorLabel(color: string): string {

@@ -96,13 +96,24 @@ describe('ScreenCaptureToolbar', () => {
     mounted.push(wrapper)
 
     expect(wrapper.findAll('[data-tool]').map((button) => button.attributes('aria-label'))).toEqual(['Rectangle', 'Ellipse', 'Arrow', 'Pen', 'Text', 'Mosaic'])
-    expect(wrapper.findAll('[data-color]')).toHaveLength(5)
+    expect(wrapper.findAll('[data-color]').map((button) => button.attributes('data-color'))).toEqual(['#ef4444', '#eab308', '#22c55e', '#3b82f6', '#000000'])
     expect(wrapper.findAll('[data-stroke-width]')).toHaveLength(3)
     expect(wrapper.findAll('[data-action]').map((button) => button.attributes('data-action'))).toEqual(['save', 'copy', 'cancel', 'confirm'])
   })
 })
 
 describe('ScreenCaptureOverlay', () => {
+  it('releases the decoded frame prop after installing pixels into the owned source canvas', async () => {
+    const { wrapper } = await mountOverlay()
+
+    expect(wrapper.emitted('frameInstalled')).toHaveLength(1)
+    await wrapper.setProps({ frame: null })
+
+    const source = wrapper.get<HTMLCanvasElement>('.screen-capture-overlay__source').element
+    expect(source.width).toBe(100)
+    expect(source.height).toBe(80)
+  })
+
   it('has no capture-shell dependency on routing, stores, networking, GraphQL, or persistence', () => {
     for (const forbidden of ['vue-router', 'pinia', 'gql-client', 'fetch(', 'XMLHttpRequest', 'useImageEditorPersistence', '@/stores/', '@/plugins/eventbus']) {
       expect(overlaySource).not.toContain(forbidden)

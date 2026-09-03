@@ -129,6 +129,23 @@ describe('createCaptureTransport', () => {
     })
   })
 
+  it('contains a secondary native failure-report rejection inside the event boundary', async () => {
+    let onFrame!: (event: { payload: CaptureFrameAvailable }) => void | Promise<void>
+    const listen: CaptureListen = async (_event, handler) => {
+      onFrame = handler
+      return () => undefined
+    }
+    const invoke = vi.fn(async (command: string) => {
+      if (command === 'screen_capture_take_frame') return new ArrayBuffer(3)
+      if (command === 'screen_capture_fail') throw new Error('native failure channel closed')
+      return undefined
+    })
+
+    await createCaptureTransport({ overlayGeneration: 7, listen, invoke, present: vi.fn() })
+
+    await expect(onFrame({ payload: frameAvailable() })).resolves.toBeUndefined()
+  })
+
   it('rejects malformed target eligibility before reading sensitive frame bytes', async () => {
     let onFrame!: (event: { payload: CaptureFrameAvailable }) => void | Promise<void>
     const listen: CaptureListen = async (_event, handler) => {

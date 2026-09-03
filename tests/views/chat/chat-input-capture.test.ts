@@ -25,6 +25,8 @@ describe('ChatInput screen capture action', () => {
     expect(chatViewSource).not.toMatch(/import\s+[^\n]+from ['"]@tauri-apps/)
     expect(chatViewSource).toContain("import('@/lib/screen-capture/tauri-capture-adapter')")
     expect(chatViewSource).toContain('target.activate(currentCaptureDestination())')
+    expect(chatViewSource).toContain('!notAllowChat.value')
+    expect(chatViewSource).toContain('watch([chatId, channelId, notAllowChat]')
     expect(chatViewSource).toContain('captureTarget?.deactivate()')
     expect(chatViewSource).toContain('captureTarget?.dispose()')
     expect(chatViewSource).toContain('doUploadImages([file], destination)')

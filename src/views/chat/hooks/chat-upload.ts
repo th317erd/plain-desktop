@@ -36,12 +36,14 @@ export function snapshotChatUploadDestination(destination: ChatUploadDestination
 export function useChatUpload(chatId: ComputedRef<string>, channelId: ComputedRef<string>, appDir: string, scrollBottom: () => void, chatText: Ref<string>, chatItems: Ref<IChatItem[]>) {
   const { t } = useI18n()
   const { getUploads } = useChatFilesUpload()
-  const { enqueue: enqueueTask } = useTasks()
+  const { enqueue: enqueueTask, cancel: cancelTask } = useTasks()
 
   const uploading = ref<IUploadItem[]>([])
   const messageUploads = reactive<Record<string, IUploadItem[]>>({})
   const uploadToMessage = new Map<string, string>()
   const sendingAgg = reactive<Record<string, { uploaded: number; speed: number }>>({})
+  const messageObjectUrls = new Map<string, string[]>()
+  const activeMessageIds = new Set<string>()
   const downloadProgress = reactive<Record<string, { downloaded: number; total: number; speed: number; status: string }>>({})
 
   function sendingText(messageId: string) {
@@ -52,6 +54,24 @@ export function useChatUpload(chatId: ComputedRef<string>, channelId: ComputedRe
 
   function currentDestination(): ChatUploadDestination {
     return snapshotChatUploadDestination({ chatId: chatId.value, channelId: channelId.value, appDir })
+  }
+
+  function cleanupMessageUpload(messageId: string): void {
+    const uploads = messageUploads[messageId] ?? []
+    const uploadIds = new Set(uploads.map((upload) => upload.id))
+    uploading.value = uploading.value.filter((upload) => !uploadIds.has(upload.id))
+    for (const upload of uploads) uploadToMessage.delete(upload.id)
+    delete messageUploads[messageId]
+    delete sendingAgg[messageId]
+    for (const url of messageObjectUrls.get(messageId) ?? []) {
+      try {
+        URL.revokeObjectURL(url)
+      } catch (error) {
+        console.error('Failed to release optimistic upload URL', error)
+      }
+    }
+    messageObjectUrls.delete(messageId)
+    activeMessageIds.delete(messageId)
   }
 
   async function handleContentUpload(files: File[], contentType: MessageType, destination: ChatUploadDestination, options: { summary?: string } = {}) {
@@ -87,6 +107,20 @@ export function useChatUpload(chatId: ComputedRef<string>, channelId: ComputedRe
       valueItems.push(itemProps)
     }
 
+    const objectUrls: string[] = []
+    try {
+      for (const upload of uploads) objectUrls.push(URL.createObjectURL(upload.file))
+    } catch (error) {
+      for (const url of objectUrls) {
+        try {
+          URL.revokeObjectURL(url)
+        } catch {
+          // Preserve the object-URL creation error that aborted this upload.
+        }
+      }
+      throw error
+    }
+
     const _content = { type: contentType, value: { items: valueItems } }
     const item: IChatItem = {
       id: 'new_' + shortUUID(),
@@ -97,9 +131,11 @@ export function useChatUpload(chatId: ComputedRef<string>, channelId: ComputedRe
       content: JSON.stringify(_content),
       _content,
       __typename: 'ChatItem',
-      data: { ids: uploads.map((it) => URL.createObjectURL(it.file)) },
+      data: { ids: objectUrls },
     }
 
+    messageObjectUrls.set(item.id, objectUrls)
+    activeMessageIds.add(item.id)
     messageUploads[item.id] = uploads
     uploads.forEach((u) => uploadToMessage.set(u.id, item.id))
     sendingAgg[item.id] = {
@@ -109,15 +145,22 @@ export function useChatUpload(chatId: ComputedRef<string>, channelId: ComputedRe
     uploading.value = [...uploading.value, ...uploads]
     const tempId = item.id
     chatItems.value = [...chatItems.value, item]
-    enqueueTask(item, uploads, frozenDestination.chatId, (sentItem) => {
-      const normalized = normalizeChatItem(sentItem)
-      chatItems.value = chatItems.value.filter((i) => i.id !== tempId)
-      if (!chatItems.value.some((i) => i.id === normalized.id)) {
-        chatItems.value = [...chatItems.value, normalized]
-      }
-      scrollBottom()
-    })
     scrollBottom()
+    try {
+      await enqueueTask(item, uploads, frozenDestination.chatId, (sentItem) => {
+        chatItems.value = chatItems.value.filter((i) => i.id !== tempId)
+        const normalized = normalizeChatItem(sentItem)
+        if (!chatItems.value.some((i) => i.id === normalized.id)) {
+          chatItems.value = [...chatItems.value, normalized]
+        }
+        scrollBottom()
+      })
+    } catch (error) {
+      chatItems.value = chatItems.value.filter((candidate) => candidate.id !== tempId)
+      throw error
+    } finally {
+      cleanupMessageUpload(tempId)
+    }
   }
 
   async function doUploadFiles(files: File[]) {
@@ -250,6 +293,10 @@ export function useChatUpload(chatId: ComputedRef<string>, channelId: ComputedRe
 
   onUnmounted(() => {
     Object.entries(handlers).forEach(([event, fn]) => emitter.off(event as any, fn))
+    for (const messageId of [...activeMessageIds]) {
+      cancelTask(messageId)
+      cleanupMessageUpload(messageId)
+    }
   })
 
   return { doUploadFiles, doUploadImages, sendLongMessageAsFile, sendingAgg, sendingText, downloadProgress, handleDownloadAction }

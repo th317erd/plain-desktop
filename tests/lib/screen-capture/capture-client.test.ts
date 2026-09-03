@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest'
 import {
   CAPTURE_RESULT_AVAILABLE_EVENT,
   CAPTURE_SESSION_ENDED_EVENT,
+  CAPTURE_SESSION_STARTED_EVENT,
   CaptureClientError,
   createCaptureClient,
   type CaptureClientDependencies,
@@ -10,6 +11,7 @@ import {
   type CaptureResultAvailable,
   type CaptureResultDescriptor,
   type CaptureSessionEnded,
+  type CaptureSessionStarted,
 } from '@/lib/screen-capture/capture-client'
 
 const PNG_BYTES = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10, 1, 2, 3, 4])
@@ -74,6 +76,7 @@ function harness(overrides: Partial<CaptureClientDependencies> = {}) {
     invoke: effectiveInvoke,
     createTargetToken: () => `target-${nextToken++}`,
     onError: (error) => errors.push(error),
+    delay: async () => undefined,
     ...overrides,
   })
   return {
@@ -83,6 +86,7 @@ function harness(overrides: Partial<CaptureClientDependencies> = {}) {
     listen: effectiveListen as typeof listen,
     onResult: () => handlers.get(CAPTURE_RESULT_AVAILABLE_EVENT) as (event: CaptureEvent<CaptureResultAvailable>) => void | Promise<void>,
     onEnded: () => handlers.get(CAPTURE_SESSION_ENDED_EVENT) as (event: CaptureEvent<CaptureSessionEnded>) => void | Promise<void>,
+    onStarted: () => handlers.get(CAPTURE_SESSION_STARTED_EVENT) as (event: CaptureEvent<CaptureSessionStarted>) => void | Promise<void>,
     order,
     unlisteners,
   }
@@ -97,6 +101,110 @@ async function startedHarness(consumer = vi.fn(async (_file: File) => undefined)
 }
 
 describe('CaptureClient target ownership', () => {
+  it('publishes only the opaque active token to the trusted native target registry', async () => {
+    const test = harness()
+    const registration = test.client.registerConsumer(async () => undefined)
+
+    expect(registration.activate()).toBe('target-1')
+    await vi.waitFor(() => {
+      expect(test.invoke).toHaveBeenCalledWith('screen_capture_register_target', {
+        targetToken: 'target-1',
+      })
+    })
+    expect(test.order.indexOf(`listen:${CAPTURE_SESSION_STARTED_EVENT}`)).toBeLessThan(test.order.indexOf('screen_capture_register_target'))
+    expect(JSON.stringify(test.invoke.mock.calls)).not.toContain('chatId')
+    expect(JSON.stringify(test.invoke.mock.calls)).not.toContain('channelId')
+
+    registration.deactivate()
+    registration.deactivate()
+    registration.dispose()
+    await vi.waitFor(() => {
+      expect(test.invoke.mock.calls.filter(([command]) => command === 'screen_capture_unregister_target')).toEqual([['screen_capture_unregister_target', { targetToken: 'target-1' }]])
+    })
+  })
+
+  it('serializes native registry mutations so stale deactivation cannot erase a newer token', async () => {
+    const firstRegistration = deferred<void>()
+    const test = harness({
+      invoke: vi.fn(async (command: string, args?: Record<string, unknown>) => {
+        if (command === 'screen_capture_register_target' && args?.targetToken === 'target-1') return firstRegistration.promise
+        return undefined
+      }),
+    })
+    const registration = test.client.registerConsumer(async () => undefined)
+
+    registration.activate()
+    registration.deactivate()
+    registration.activate()
+    firstRegistration.resolve()
+
+    await vi.waitFor(() => {
+      expect(test.invoke.mock.calls.filter(([command]) => command.startsWith('screen_capture_'))).toEqual([
+        ['screen_capture_register_target', { targetToken: 'target-1' }],
+        ['screen_capture_unregister_target', { targetToken: 'target-1' }],
+        ['screen_capture_register_target', { targetToken: 'target-2' }],
+      ])
+    })
+    expect(test.client.activeTarget()).toEqual({ windowLabel: 'main', targetToken: 'target-2' })
+  })
+
+  it('adopts a trusted global session for the active token and delivers it exactly once', async () => {
+    const consumer = vi.fn(async (_file: File) => undefined)
+    const test = harness()
+    test.client.registerConsumer(consumer).activate()
+    await vi.waitFor(() => expect(test.invoke).toHaveBeenCalledWith('screen_capture_register_target', { targetToken: 'target-1' }))
+
+    await test.onStarted()({ payload: { sessionId: 'global-1', targetToken: 'target-1' } })
+    await test.onResult()({
+      payload: resultAvailable({ descriptor: resultDescriptor({ sessionId: 'global-1' }) }),
+    })
+
+    expect(consumer).toHaveBeenCalledOnce()
+    expect(test.invoke.mock.calls.filter(([command]) => command === 'screen_capture_take_result')).toHaveLength(1)
+    expect(test.invoke).toHaveBeenCalledWith('screen_capture_ack_result', {
+      sessionId: 'global-1',
+      resultId: 'result-1',
+      targetToken: 'target-1',
+    })
+    expect(test.client.activeCapture()).toBeNull()
+  })
+
+  it('rejects and invalidates a global session announced for a deactivated token', async () => {
+    const consumer = vi.fn(async (_file: File) => undefined)
+    const test = harness()
+    const registration = test.client.registerConsumer(consumer)
+    registration.activate()
+    await vi.waitFor(() => expect(test.invoke).toHaveBeenCalledWith('screen_capture_register_target', { targetToken: 'target-1' }))
+    registration.deactivate()
+
+    await test.onStarted()({ payload: { sessionId: 'global-stale', targetToken: 'target-1' } })
+    await vi.waitFor(() => {
+      expect(test.invoke).toHaveBeenCalledWith('screen_capture_invalidate_target', {
+        sessionId: 'global-stale',
+        targetToken: 'target-1',
+      })
+    })
+
+    expect(test.client.activeCapture()).toBeNull()
+    expect(consumer).not.toHaveBeenCalled()
+    expect(test.errors.some((error) => error.code === 'target_unavailable')).toBe(true)
+  })
+
+  it('invalidates an unadopted global session while a different local session is active', async () => {
+    const test = await startedHarness()
+
+    await test.onStarted()({ payload: { sessionId: 'global-unadopted', targetToken: 'target-1' } })
+    await vi.waitFor(() => {
+      expect(test.invoke).toHaveBeenCalledWith('screen_capture_invalidate_target', {
+        sessionId: 'global-unadopted',
+        targetToken: 'target-1',
+      })
+    })
+
+    expect(test.client.activeCapture()).toEqual({ sessionId: 'session-1', targetToken: 'target-1' })
+    expect(test.errors.some((error) => error.code === 'capture_busy')).toBe(true)
+  })
+
   it('registers the result listener before start and freezes the active opaque target', async () => {
     const test = harness()
     const registration = test.client.registerConsumer(async () => undefined)
@@ -105,7 +213,10 @@ describe('CaptureClient target ownership', () => {
     const started = await test.client.startComposerCapture()
 
     expect(started.sessionId).toBe('session-1')
-    expect(test.order.slice(0, 3)).toEqual([`listen:${CAPTURE_RESULT_AVAILABLE_EVENT}`, `listen:${CAPTURE_SESSION_ENDED_EVENT}`, 'screen_capture_start'])
+    const startIndex = test.order.indexOf('screen_capture_start')
+    expect(test.order.indexOf('screen_capture_register_target')).toBeLessThan(startIndex)
+    expect(test.order.indexOf(`listen:${CAPTURE_RESULT_AVAILABLE_EVENT}`)).toBeLessThan(startIndex)
+    expect(test.order.indexOf(`listen:${CAPTURE_SESSION_ENDED_EVENT}`)).toBeLessThan(startIndex)
     expect(test.invoke).toHaveBeenCalledWith('screen_capture_start', {
       targetWindowLabel: 'main',
       targetToken: 'target-1',
@@ -182,7 +293,10 @@ describe('CaptureClient target ownership', () => {
     owner.deactivate()
     unrelated.deactivate()
     unrelated.dispose()
-    expect(test.invoke).not.toHaveBeenCalled()
+    await vi.waitFor(() => {
+      expect(test.invoke.mock.calls.filter(([command]) => command === 'screen_capture_unregister_target')).toHaveLength(1)
+    })
+    expect(test.invoke.mock.calls.some(([command]) => command === 'screen_capture_invalidate_target')).toBe(false)
 
     owner.activate()
     await test.client.startComposerCapture()
@@ -303,9 +417,9 @@ describe('CaptureClient target ownership', () => {
     expect(test.client.activeCapture()).toBeNull()
     await expect(test.client.startComposerCapture()).resolves.toMatchObject({ sessionId: 'session-1' })
 
-    expect(listenAttempts).toBe(4)
+    expect(listenAttempts).toBe(5)
     expect(partialUnlisten).toHaveBeenCalledOnce()
-    expect(test.invoke).toHaveBeenCalledOnce()
+    expect(test.invoke.mock.calls.filter(([command]) => command === 'screen_capture_start')).toHaveLength(1)
   })
 
   it.each(['cancelled', 'saved', 'copied', 'failed', 'completed'] as const)('clears local busy state after a matching %s terminal event', async (outcome) => {
@@ -464,6 +578,44 @@ describe('CaptureClient result delivery', () => {
     expect(test.invoke).toHaveBeenLastCalledWith('screen_capture_ack_result', expect.any(Object))
   })
 
+  it('lets a committed immutable delivery finish before deactivating its target', async () => {
+    const consumed = deferred<void>()
+    const consumer = vi.fn(async (_file: File) => consumed.promise)
+    const test = await startedHarness(consumer)
+
+    const delivery = test.onResult()({ payload: resultAvailable() })
+    await vi.waitFor(() => expect(consumer).toHaveBeenCalledOnce())
+    test.registration.deactivate()
+    await Promise.resolve()
+
+    expect(test.invoke.mock.calls.some(([command]) => command === 'screen_capture_invalidate_target')).toBe(false)
+
+    consumed.resolve()
+    await delivery
+
+    expect(test.invoke.mock.calls.filter(([command]) => command === 'screen_capture_ack_result')).toHaveLength(1)
+    expect(test.invoke.mock.calls.some(([command]) => command === 'screen_capture_invalidate_target')).toBe(false)
+    expect(test.client.activeCapture()).toBeNull()
+  })
+
+  it('releases a failed committed delivery before honoring deferred target invalidation', async () => {
+    const consumed = deferred<void>()
+    const consumer = vi.fn(async (_file: File) => consumed.promise)
+    const test = await startedHarness(consumer)
+
+    const delivery = test.onResult()({ payload: resultAvailable() })
+    await vi.waitFor(() => expect(consumer).toHaveBeenCalledOnce())
+    test.registration.deactivate()
+    consumed.reject(new Error('upload failed'))
+    await delivery
+    await vi.waitFor(() => {
+      expect(test.invoke.mock.calls.some(([command]) => command === 'screen_capture_invalidate_target')).toBe(true)
+    })
+
+    const commands = test.invoke.mock.calls.map(([command]) => command)
+    expect(commands.indexOf('screen_capture_release_result')).toBeLessThan(commands.indexOf('screen_capture_invalidate_target'))
+  })
+
   it('retries only the acknowledgment without requiring another result event', async () => {
     let ackAttempts = 0
     const consumer = vi.fn(async (_file: File) => undefined)
@@ -486,6 +638,34 @@ describe('CaptureClient result delivery', () => {
     expect(test.invoke.mock.calls.some(([command]) => command === 'screen_capture_release_result')).toBe(false)
   })
 
+  it('uses bounded backoff across multiple transient acknowledgment failures without redelivery', async () => {
+    let ackAttempts = 0
+    const delays: number[] = []
+    const consumer = vi.fn(async (_file: File) => undefined)
+    const test = harness({
+      delay: vi.fn(async (milliseconds: number) => {
+        delays.push(milliseconds)
+      }),
+      invoke: vi.fn(async (command: string) => {
+        if (command === 'screen_capture_register_target') return undefined
+        if (command === 'screen_capture_start') return { sessionId: 'session-1', overlayGeneration: 7, phase: 'active' }
+        if (command === 'screen_capture_take_result') return PNG_BYTES.slice().buffer
+        if (command === 'screen_capture_ack_result' && ackAttempts++ < 2) throw new Error('transient acknowledgment failure')
+        return undefined
+      }),
+    })
+    test.client.registerConsumer(consumer).activate()
+    await test.client.startComposerCapture()
+
+    await test.onResult()({ payload: resultAvailable() })
+
+    expect(delays).toEqual([50, 200])
+    expect(consumer).toHaveBeenCalledOnce()
+    expect(test.invoke.mock.calls.filter(([command]) => command === 'screen_capture_take_result')).toHaveLength(1)
+    expect(test.invoke.mock.calls.filter(([command]) => command === 'screen_capture_ack_result')).toHaveLength(3)
+    expect(test.invoke.mock.calls.some(([command]) => command === 'screen_capture_release_result')).toBe(false)
+  })
+
   it('does not resurrect state when a terminal event wins a late acknowledgment-error race', async () => {
     const consumer = vi.fn(async (_file: File) => undefined)
     let test!: ReturnType<typeof harness>
@@ -499,6 +679,33 @@ describe('CaptureClient result delivery', () => {
           })
           throw new Error('late IPC rejection')
         }
+        return undefined
+      }),
+    })
+    test.client.registerConsumer(consumer).activate()
+    await test.client.startComposerCapture()
+
+    await test.onResult()({ payload: resultAvailable() })
+
+    expect(consumer).toHaveBeenCalledOnce()
+    expect(test.invoke.mock.calls.filter(([command]) => command === 'screen_capture_ack_result')).toHaveLength(1)
+    expect(test.client.activeCapture()).toBeNull()
+    expect(test.errors.some((error) => error.code === 'acknowledgment_failed')).toBe(false)
+  })
+
+  it('stops acknowledgment backoff when terminal cleanup wins during the delay', async () => {
+    const consumer = vi.fn(async (_file: File) => undefined)
+    let test!: ReturnType<typeof harness>
+    test = harness({
+      delay: vi.fn(async () => {
+        await test.onEnded()({
+          payload: { sessionId: 'session-1', targetToken: 'target-1', outcome: 'completed' },
+        })
+      }),
+      invoke: vi.fn(async (command: string) => {
+        if (command === 'screen_capture_start') return { sessionId: 'session-1', overlayGeneration: 7, phase: 'active' }
+        if (command === 'screen_capture_take_result') return PNG_BYTES.slice().buffer
+        if (command === 'screen_capture_ack_result') throw new Error('transient acknowledgment failure')
         return undefined
       }),
     })
@@ -607,6 +814,30 @@ describe('CaptureClient result delivery', () => {
     }
   })
 
+  it('aborts delivery when taking the result rejects before lease ownership is known', async () => {
+    const consumer = vi.fn(async (_file: File) => undefined)
+    const test = harness({
+      invoke: vi.fn(async (command: string) => {
+        if (command === 'screen_capture_start') {
+          return { sessionId: 'session-1', overlayGeneration: 7, phase: 'result_available' }
+        }
+        if (command === 'screen_capture_take_result') throw new Error('ambiguous raw IPC failure')
+        return undefined
+      }),
+    })
+    test.client.registerConsumer(consumer).activate()
+    await test.client.startComposerCapture()
+
+    await test.onResult()({ payload: resultAvailable() })
+
+    expect(consumer).not.toHaveBeenCalled()
+    expect(test.invoke).toHaveBeenCalledWith('screen_capture_release_result', {
+      sessionId: 'session-1',
+      resultId: 'result-1',
+      targetToken: 'target-1',
+    })
+  })
+
   it('does not consume or release a late raw response after terminal cleanup', async () => {
     const bytes = deferred<unknown>()
     const consumer = vi.fn(async (_file: File) => undefined)
@@ -656,7 +887,7 @@ describe('CaptureClient result delivery', () => {
     await test.client.startComposerCapture()
     await vi.waitFor(() => expect(consumer).toHaveBeenCalledOnce())
 
-    expect(invoke.mock.calls.map(([command]) => command)).toEqual(['screen_capture_start', 'screen_capture_take_result', 'screen_capture_ack_result'])
+    expect(invoke.mock.calls.map(([command]) => command)).toEqual(['screen_capture_register_target', 'screen_capture_start', 'screen_capture_take_result', 'screen_capture_ack_result'])
   })
 
   it('unlistens and invalidates the target on disposal', async () => {
@@ -667,9 +898,36 @@ describe('CaptureClient result delivery', () => {
     test.client.dispose()
     await test.onResult()({ payload: resultAvailable() })
 
-    expect(test.unlisteners).toHaveLength(2)
+    expect(test.unlisteners).toHaveLength(3)
     for (const unlisten of test.unlisteners) expect(unlisten).toHaveBeenCalledOnce()
     expect(test.client.activeTarget()).toBeNull()
     expect(test.invoke.mock.calls.some(([command]) => command === 'screen_capture_take_result')).toBe(false)
+    expect(test.invoke).toHaveBeenCalledWith('screen_capture_invalidate_target', {
+      sessionId: 'session-1',
+      targetToken: 'target-1',
+    })
+  })
+
+  it('retries target invalidation after disposal clears the local session', async () => {
+    let invalidationAttempts = 0
+    const test = harness({
+      invoke: vi.fn(async (command: string) => {
+        if (command === 'screen_capture_start') {
+          return { sessionId: 'session-1', overlayGeneration: 7, phase: 'active' }
+        }
+        if (command === 'screen_capture_invalidate_target') {
+          invalidationAttempts += 1
+          if (invalidationAttempts === 1) throw new Error('ambiguous IPC failure')
+        }
+        return undefined
+      }),
+    })
+    test.client.registerConsumer(async () => undefined).activate()
+    await test.client.startComposerCapture()
+
+    test.client.dispose()
+
+    await vi.waitFor(() => expect(invalidationAttempts).toBe(2))
+    expect(test.errors.some((error) => error.code === 'target_invalidation_failed')).toBe(false)
   })
 })

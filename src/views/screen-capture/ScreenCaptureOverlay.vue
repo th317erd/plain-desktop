@@ -103,7 +103,7 @@ import { CaptureSelection, handleCenters, placeCaptureToolbar, type FrameBounds,
 import ScreenCaptureToolbar, { type CaptureAnnotationTool, type CaptureExportAction } from './ScreenCaptureToolbar.vue'
 
 interface Props {
-  frame: ImageData
+  frame: ImageData | null
   onExport: (action: CaptureExportAction, payload: CaptureExportPayload) => Promise<void>
   onCancel: () => Promise<void> | void
   canConfirm?: boolean
@@ -114,6 +114,10 @@ const props = withDefaults(defineProps<Props>(), {
   canConfirm: true,
   messages: () => defaultCaptureMessages,
 })
+const emit = defineEmits<{ frameInstalled: [] }>()
+
+let initialFrame = props.frame
+if (!initialFrame) throw new Error('screen capture frame is required during overlay mount')
 
 const annotation = useAnnotationSession()
 const { canvasRef, overlayRef, wrapRef } = annotation
@@ -121,7 +125,7 @@ const stageRef = ref<HTMLElement | null>(null)
 const frozenCanvasRef = ref<HTMLCanvasElement | null>(null)
 const toolbarHostRef = ref<HTMLElement | null>(null)
 const textInputRef = ref<HTMLTextAreaElement | null>(null)
-const frameBounds: FrameBounds = { width: props.frame.width, height: props.frame.height }
+const frameBounds: FrameBounds = { width: initialFrame.width, height: initialFrame.height }
 let selection = new CaptureSelection(frameBounds)
 const selectionRect = ref<SelectionRect | null>(null)
 const activeCaptureTool = ref<CaptureAnnotationTool | null>(null)
@@ -489,13 +493,17 @@ async function awaitPaint(): Promise<void> {
 }
 
 function installFrame() {
+  const frame = initialFrame
+  if (!frame) throw new Error('screen capture frame was already released')
   const source = frozenCanvasRef.value
   if (!source) throw new Error('screen capture source canvas is unavailable')
   source.width = frameBounds.width
   source.height = frameBounds.height
   const context = source.getContext('2d', { alpha: false })
   if (!context) throw new Error('screen capture source context is unavailable')
-  context.putImageData(props.frame, 0, 0)
+  context.putImageData(frame, 0, 0)
+  initialFrame = null
+  emit('frameInstalled')
   canvasRef.value?.setAttribute('width', String(frameBounds.width))
   canvasRef.value?.setAttribute('height', String(frameBounds.height))
   overlayRef.value?.setAttribute('width', String(frameBounds.width))

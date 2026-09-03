@@ -1,17 +1,26 @@
 import type { Event, UnlistenFn } from '@tauri-apps/api/event'
-import { createApp, defineComponent, h, ref } from 'vue'
+import { createApp, defineComponent, h, ref, shallowRef } from 'vue'
 import ScreenCaptureOverlay, { type ScreenCaptureOverlayHandle } from './ScreenCaptureOverlay.vue'
-import { createCaptureOverlaySession, type CaptureOverlayMount, type CaptureOverlayMountOptions, type CaptureOverlaySessionEnded, type CaptureTargetUnavailable } from './capture-overlay-session'
+import {
+  createCaptureOverlaySession,
+  type CaptureDeliveryFailed,
+  type CaptureOverlayMount,
+  type CaptureOverlayMountOptions,
+  type CaptureOverlaySessionEnded,
+  type CaptureTargetUnavailable,
+} from './capture-overlay-session'
 import { captureMessagesForLanguages, type CaptureMessages } from './capture-localization'
 import type { CaptureFrameAvailable, CaptureInvoke, CaptureListen } from './capture-transport'
 import { createCaptureTransport, parseOverlayGeneration } from './capture-transport'
 import './screen-capture.scss'
 
 const TARGET_UNAVAILABLE_EVENT = 'screen-capture://target-unavailable'
+const DELIVERY_FAILED_EVENT = 'screen-capture://delivery-failed'
 const SESSION_ENDED_EVENT = 'screen-capture://session-ended'
 
 function mountOverlay(root: HTMLElement, image: ImageData, options: CaptureOverlayMountOptions, messages: CaptureMessages): CaptureOverlayMount {
   const canConfirm = ref(options.canConfirm)
+  const frame = shallowRef<ImageData | null>(image)
   const overlay = ref<ScreenCaptureOverlayHandle | null>(null)
   let disposed = false
   const app = createApp(
@@ -20,22 +29,35 @@ function mountOverlay(root: HTMLElement, image: ImageData, options: CaptureOverl
       setup: () => () =>
         h(ScreenCaptureOverlay, {
           ref: overlay,
-          frame: image,
+          frame: frame.value,
           canConfirm: canConfirm.value,
           messages,
           onExport: options.onExport,
           onCancel: options.onCancel,
+          onFrameInstalled: () => {
+            frame.value = null
+          },
         }),
     })
   )
 
   root.replaceChildren()
-  app.mount(root)
-  const source = root.querySelector<HTMLCanvasElement>('.screen-capture-overlay__source')
-  if (!overlay.value || source?.width !== image.width || source.height !== image.height) {
-    app.unmount()
+  try {
+    app.mount(root)
+    const source = root.querySelector<HTMLCanvasElement>('.screen-capture-overlay__source')
+    if (!overlay.value || source?.width !== image.width || source.height !== image.height) {
+      throw new Error('screen capture frozen pixels were not installed')
+    }
+  } catch (error) {
+    frame.value = null
+    try {
+      overlay.value?.dispose()
+      app.unmount()
+    } catch {
+      // Preserve the mount/validation error that owns this cleanup path.
+    }
     root.replaceChildren()
-    throw new Error('screen capture frozen pixels were not installed')
+    throw error
   }
 
   return {
@@ -91,6 +113,11 @@ export async function bootstrapScreenCapture(): Promise<void> {
     unlisteners.push(
       await listen<CaptureOverlaySessionEnded>(SESSION_ENDED_EVENT, ({ payload }) => {
         overlaySession.sessionEnded(payload)
+      })
+    )
+    unlisteners.push(
+      await listen<CaptureDeliveryFailed>(DELIVERY_FAILED_EVENT, ({ payload }) => {
+        overlaySession.deliveryFailed(payload)
       })
     )
     transport = await createCaptureTransport({

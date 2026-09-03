@@ -90,9 +90,6 @@ export async function bootstrapFullApp(): Promise<void> {
         invoke('media_preview_init').catch((e) => {
           console.warn('media_preview_init failed', e)
         })
-        invoke('screen_capture_init').catch((e) => {
-          console.warn('screen_capture_init failed', e)
-        })
       })
     }, 2000)
   }
