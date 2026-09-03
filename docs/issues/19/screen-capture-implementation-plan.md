@@ -96,17 +96,17 @@ The failure cap may shrink but may not grow. Because this feature changes Rust d
 
 | Territory | Existing role | Planned treatment |
 |---|---|---|
-| `src/views/chat/ChatInput.vue` | Image/folder composer actions and `send-images: File[]` emit | Add only the Tauri-gated trigger and targeted completion adapter |
-| `src/views/chat/ChatView.vue` and `hooks/chat-upload.ts` | Existing optimistic image upload/send path | Reuse unchanged; no new upload protocol |
+| `src/views/chat/ChatInput.vue` | Image/folder composer actions and `send-images: File[]` emit | Add only the Tauri-gated trigger; async target ownership remains in `ChatView` |
+| `src/views/chat/ChatView.vue` and `hooks/chat-upload.ts` | Existing optimistic image upload/send path | Reuse the upload protocol, but snapshot immutable destination IDs before the first await and expose an acknowledged async capture consumer |
 | `src/views/image-editor/utils/types.ts` | Typed annotation-layer union | Reuse as the canonical layer contract |
 | `renderer.ts`, draw-layer utilities, Pixi renderer | Preview and final compositing, including mosaic | Reuse behind an extracted in-memory annotation session |
 | `useImageEditorDoc*`, `useImageEditorUndo`, `useImageEditorLayers`, transform utilities | Typed mutations and undo/redo | Reuse; characterize before extraction |
 | `useImageEditorCore.ts` | Currently mixes editor engine, persistence, transport, routing, and lifecycle | Split once; full editor keeps adapters, capture uses ephemeral adapter |
 | `useImageEditorPersistence.ts`, `plain-app-store.ts`, `event-sync-transport.ts` | Phone/server project storage and Yjs transport | Explicitly forbidden from capture imports |
-| `src/plugins/router.ts`, `src/main.ts`, `App.vue` | SPA and utility-window bootstrap | Add a self-contained `/screen-capture` utility route with a lightweight bootstrap |
+| `src/plugins/router.ts`, `src/main.ts`, `App.vue` | SPA and utility-window bootstrap | Dispatch `/screen-capture` before full-app imports; do not add it to the shared router or boot `App.vue` |
 | `src-tauri/src/lib.rs`, `commands/mod.rs` | Plugin/state/command registration and process window lifecycle | Register a modular capture subsystem; keep orchestration out of `lib.rs` |
 | `commands/window.rs` | General 1200×800 cascaded app windows | Do not reuse for the capture overlay; it has incompatible semantics |
-| `capabilities/*.json` | Per-window Tauri permissions | Add a least-privilege `screen-capture-*` capability |
+| `capabilities/*.json` | Per-window Tauri plugin/core permissions | Give the overlay only required plugin/core permissions; validate every custom command's caller label and session ownership, and record the existing process-wide custom-command ACL debt |
 | `.github/workflows/check.yml`, `release.yml` | Linux/native dependency installation and cross-platform builds | Add only dependencies proved by P0 |
 
 Non-obvious consumers and lifecycle hazards:
@@ -173,9 +173,11 @@ The implementation must name and type these contracts before moving code:
 - `CssPoint` and `CssRect`: logical coordinates inside the overlay webview.
 - `MonitorGeometry`: stable session-local ID, physical origin/size, logical origin/size, and scale factor.
 - `CapturedFrame`: session ID, monitor geometry, checked width/height/stride/pixel format, and a bounded raw byte handle.
-- `CaptureTrigger`: composer or global, with origin window label and optional immutable target token.
-- `CaptureTarget`: origin webview label plus opaque frontend target token. Rust must not know chat recipients.
-- `CapturePhase`: `idle → hiding-origin → capturing → loading-overlay → selecting → annotating → exporting → delivering → restoring → idle`, with error/cancel edges through `restoring`.
+- `CaptureTrigger`: composer or global.
+- `CaptureOrigin`: optional invoking Plain webview and its pre-capture visibility/minimized/focus state. A global shortcut may have no origin to hide.
+- `CaptureTarget`: eligible webview label plus opaque frontend target token. It is independent of the origin; Rust must not know chat recipients.
+- `NativeCapturePhase`: `idle → waiting-for-overlay → hiding-origin → capturing → frame-available → awaiting-presentation → active → result-available → delivering → restoring → idle`, with error/cancel edges through `restoring`.
+- `CaptureUiPhase`: `waiting → loading-frame → selecting → selected ↔ drawing|resizing|moving|editing-text → exporting → waiting-for-delivery → completed`.
 - `CaptureResult`: session ID, PNG byte handle, dimensions, filename, and MIME; never the PNG byte array in a JSON event.
 - `CaptureError`: stable machine code plus optional diagnostic cause. User messages are localized in Vue.
 - `SelectionModel`: normalized/clamped frame-space rectangle plus active drag/resize operation.
@@ -199,9 +201,10 @@ Every multiplication/addition used to size native buffers is checked. Negative d
 
 - JSON events carry only session/result IDs and metadata.
 - The overlay retrieves raw RGBA through a Tauri raw IPC response (`ArrayBuffer`) and acknowledges successful canvas decode; Rust then drops its raw frame.
-- The overlay sends the final PNG through a raw IPC request. Rust stores it under a one-shot result ID.
-- The origin retrieves the PNG through a raw IPC response, creates `File([bytes], filename, { type: 'image/png' })`, validates the session/target token, emits `send-images`, and acknowledges delivery.
-- Results are one-shot, size-bounded, and expire on cancel, error, target close, or timeout. No temporary file is the primary transport.
+- The overlay sends the final PNG through a raw IPC request. Rust stores one size-bounded result under an authenticated result ID.
+- The frozen target acquires one authenticated delivery-attempt lease to read the PNG through a raw IPC response. Concurrent reads are rejected; an explicit failure releases the lease without clearing bytes, and only a success acknowledgment clears the result.
+- The target creates `File([bytes], filename, { type: 'image/png' })`, validates the session/target token, invokes the registered async `ChatView` consumer, and acknowledges delivery only after the existing upload path resolves.
+- Results expire on acknowledgment, cancel, terminal error, target close, or timeout. No temporary file is the primary transport.
 
 P0 must prove this raw-IPC path with a 4K deterministic frame. If a platform blocks it, the only fallback is a random session-scoped mode-0600 temp artifact with verified cleanup; base64/JSON is not allowed.
 
@@ -301,7 +304,7 @@ Rollback: revert the extraction commit; no capture consumer exists yet.
 
 ### P2 — Native capture coordinator and overlay lifecycle
 
-Owner: native lead. May run in parallel with P1 only after P0 contracts are frozen.
+Owner: native lead. May run in parallel with P1 only after P0 contracts are frozen. The integration owner lands the small bootstrap-dispatcher slice and hands the ready shell back to the native lead for barrier tests.
 
 Planned ownership:
 
@@ -309,13 +312,15 @@ Planned ownership:
 - capture-specific additions to `commands/mod.rs`
 - capture capability/permission files
 - capture-specific dependency and workflow changes
+- integration-owned `src/main.ts`, `src/bootstrap/full-app.ts`, and ready-only `src/views/screen-capture/**` shell as one serialized handoff
 
 Work:
 
 - Implement managed `CaptureCoordinator` state and per-platform backend adapters.
 - Adapt Xenocept's cursor-monitor selection, macOS permission/conversion code, X11 XShm/singleton-display behavior, Wayland shortcut portal, borderless overlay positioning, focus fixes, and stale-capture protection.
-- Create/prewarm a dedicated `screen-capture-overlay` webview at `/screen-capture`.
-- Implement checked one-shot raw-frame/result handles and raw IPC commands.
+- Create/prewarm a dedicated `screen-capture-overlay` webview at `/screen-capture` and land its ready-only minimal bootstrap shell in this phase so the native readiness barrier can be proved.
+- Split `src/main.ts` into a dependency-free path dispatcher and dynamically imported full-app/capture bootstraps. The capture branch must never import `App.vue`, the shared router, Pinia, i18n preferences, sockets, discovery, GraphQL, or media-preview initialization.
+- Implement a listener-before-ready generation barrier, a separate frame-presented barrier, one-shot raw-frame retrieval, single-reader result leases, explicit retry release, and result acknowledgment.
 - Implement idempotent start/cancel/fail/complete/ack cleanup.
 - Record and restore the origin window state; exclude utility windows from lifecycle/dock enumeration.
 - Register process-level shortcuts and expose registration status.
@@ -324,7 +329,8 @@ Gate:
 
 - State-machine tests cover every legal edge and reject every illegal/re-entrant edge.
 - Window-adapter tests prove origin restoration before overlay destruction on success, cancel, decode failure, overlay close, and origin close.
-- Stale/wrong-session/raw-result reads fail closed; successful reads are one-shot.
+- Stale/wrong-session/raw-result reads fail closed; frame reads are one-shot, while a result permits only one delivery-attempt lease at a time and survives explicit failure release until acknowledgment clears it exactly once.
+- Start-before-ready, ready-before-start, stale generations, readiness timeout, and overlay reload/destruction restore safely; the overlay is never shown before frame presentation is acknowledged.
 - Events contain metadata only; a test rejects payload contracts containing byte arrays/base64.
 - Shortcut mapping tests cover `Alt+A` and `Option+Command+A`; Wayland portal translation tests are retained/adapted.
 - Rust full `--locked` test/check gates and cross-platform CI green.
@@ -333,11 +339,11 @@ Rollback: revert the coordinator commit; the editor extraction remains behavior-
 
 ### P3 — Frozen overlay, selection, and capture toolbar
 
-Owner: capture-frontend lead. Own `src/views/screen-capture/**` and capture-specific tests/i18n only.
+Owner: capture-frontend lead. Extend the P2 capture shell within `src/views/screen-capture/**`; own capture-specific tests/i18n only.
 
 Work:
 
-- Add the guarded `/screen-capture` utility route and minimal utility bootstrap.
+- Extend the guarded capture-only bootstrap shell; `/screen-capture` remains outside the shared router and full-app dependency graph.
 - Fetch/decode the native frame, acknowledge it, and render a fully opaque frozen monitor.
 - Implement the pure `SelectionModel`: four drag directions, min size, bounds clamp, move, eight resize handles, live frame-pixel dimensions, exterior dim, and toolbar placement.
 - Compose the P1 `AnnotationSession` with capture-only toolbar/tool policy.
@@ -364,10 +370,11 @@ Owner: integration lead only. This phase serializes all hot files.
 
 Work:
 
-- Add `CaptureClient`, which registers only the currently active eligible ChatInput and freezes an opaque target token per session.
+- Add one `CaptureClient` singleton per webview. `ChatView` registers/activates the currently eligible async consumer, while `ChatInput` only requests capture; freeze its opaque target token per session.
 - Install the result listener before invoking start to prevent result-before-listener races.
 - Add the Tauri-only scissors action after image/folder in current live-main `ChatInput.vue`.
-- Wire confirm to retrieve the one-shot PNG, construct exactly one PNG `File`, and call the existing `emit('send-images', [file])` path once.
+- Wire confirm to read the retained PNG, construct exactly one PNG `File`, and await the registered `ChatView` consumer before acknowledging native delivery. Do not rely on awaiting a Vue emit, because emits return `void`.
+- Snapshot `{ chatId, channelId, appDir }` at upload entry before image decoding or any other await so route changes cannot redirect a captured result.
 - Route the global shortcut to the same coordinator/client. Confirm is disabled if no target was frozen; save/copy remain available.
 - If the target deactivates or closes, invalidate it and keep the overlay open with save/copy/cancel available rather than sending to a new/current chat.
 - Preserve the recent emoji and Tauri file-drop behavior in `ChatInput.vue` and `main.ts`.
@@ -377,7 +384,7 @@ Gate:
 - Web build: scissors absent and no Tauri capture module evaluated.
 - Tauri component test: scissors present in the correct order and duplicate clicks cannot start two sessions.
 - Target-correlation tests cover cached ChatInputs, route changes, multiple windows, stale completions, target close, wrong session ID, and global activation without a target.
-- Confirm emits one `File` with exact name/type/bytes; cancel/save/copy emit none; delivery failure keeps the result retryable.
+- Confirm supplies one `File` with exact name/type/bytes to the existing upload path; cancel/save/copy supply none; delivery failure keeps the result readable and retryable until acknowledgment.
 - Existing upload mock proves the unchanged `doUploadImages` path receives the file exactly once.
 - Recent emoji autocomplete and file-drop tests remain green by name.
 - Full frontend/Rust gates green within the baseline cap.
@@ -391,7 +398,7 @@ Owner: native + capture-frontend leads with disjoint files; integration owner re
 Work:
 
 - Implement native PNG clipboard and native save dialog/write adapters behind `CaptureExport`.
-- Grant only capture-overlay permissions required for raw IPC, dialog/save, clipboard, and window control.
+- Grant only capture-overlay plugin/core permissions required for its lifecycle; perform save/copy inside validated custom commands rather than granting generic filesystem/dialog/clipboard access.
 - Keep overlay state until native success is acknowledged.
 - Add localized permission, shortcut, capture, decode, encode, clipboard, save, target, and monitor-change failures.
 - Verify clipboard ownership survives overlay closure and app focus changes.
@@ -399,7 +406,7 @@ Work:
 Gate:
 
 - Adapter tests cover success, denial, cancellation, invalid path, write failure, clipboard unavailable, and size limit.
-- Capability audit shows the capture overlay cannot call unrelated filesystem, shell, network, store, or app commands.
+- Capability audit shows the overlay cannot call unrelated plugin/core filesystem, shell, network, store, opener, notification, or ordinary window APIs. Every capture custom command rejects a wrong caller label/session; the repository's existing lack of generated ACL for all other custom app commands is documented as residual debt, not misrepresented as solved here.
 - Save/copy success produces an exact PNG; failure leaves source, selection, layers, and history unchanged.
 - No temp artifact remains after any tested terminal path.
 - All prior gates remain green.
@@ -489,7 +496,7 @@ Parallel work begins only after P0 freezes the contracts.
 
 ### Capture-overlay worker
 
-- Owns `src/views/screen-capture/**`, its tests, and capture-specific locale files after P1 interfaces are frozen.
+- Extends the P2-owned ready shell in `src/views/screen-capture/**`, then owns that directory, its tests, and capture-specific locale files after P1 interfaces are frozen.
 - Must not edit Rust, existing image-editor internals, ChatInput, or global bootstrap files.
 - Reports: selection/tool coverage, screenshots, browser tests, accessibility/keyboard results, and errors still needing native support.
 
@@ -534,12 +541,16 @@ The completed adversarial pass found and absorbed these failure modes:
 |---|---|---|
 | “Plain needs Xenocept's editor” | Plain already has a stronger typed annotation stack | Extract one Plain kernel; omit Xenocept canvas/radial UI |
 | “Existing Plain screenshot code is the feature” | It captures a phone mirror frame, not the desktop | Keep it out of the implementation territory |
-| “Tauri events can carry the image” | JSON/base64 copies can explode memory on 4K/8K frames | Binary IPC and one-shot bounded native handles |
+| “Tauri events can carry the image” | JSON/base64 copies can explode memory on 4K/8K frames | Binary IPC, one-shot bounded frame handles, and acknowledged retryable result handles |
 | “Global shortcut plugin covers Linux” | Its Linux backend is X11-only | Adapt Xenocept's XDG portal path for Wayland |
 | “Xenocept proves Wayland capture” | It has no owned PipeWire capture path and docs overstate support | P0 must prove direct capture or use an explicit portal chooser fallback |
 | “Region coordinates are reusable” | Xenocept backends disagree about global versus local coordinates | New typed physical/global/frame/CSS contracts and conversion tests |
 | “Close overlay, then restore” | Plain may exit when the last visible window closes | Restore origin before overlay destruction |
 | “The active chat can be looked up at completion” | Keep-alive routes and multiple windows can redirect the result | Freeze an opaque target token at session start and fail closed if stale |
+| “A normal router route is a lightweight overlay” | Static `main.ts`/router/App imports start preferences, sockets, discovery, chat state, and media preview before route resolution | Branch before all full-app imports and mount a dedicated capture root |
+| “Vue emit can acknowledge an async upload” | Component emits return `void`, and the upload hook reads reactive route IDs after async image decode | Register an async `ChatView` consumer and snapshot destination IDs before the first await |
+| “One-shot PNG reads are retryable” | Reading would destroy the only result before upload success is known, while unrestricted retries can multiply large buffers | One authenticated read lease at a time, explicit failure release, and explicit success acknowledgment |
+| “A capability JSON restricts custom commands” | This app has no generated Tauri `AppManifest`; capability files currently govern plugin/core commands only | Restrict plugin/core permissions, validate capture callers in Rust, and disclose legacy process-wide custom-command ACL debt |
 | “Current image editor core is reusable as-is” | It autosaves, broadcasts Yjs, rewrites history, and loads base64 | Extract ephemeral core; mechanically ban persistence/transport imports |
 | “Save/copy can clear optimistically” | Xenocept's fire-and-forget submit loses work on failure | Cleanup only after acknowledged native/delivery success |
 | “Latest local main is current” | Upstream landed emoji/file-drop changes in the exact hot files | Fresh-main branch and per-phase drift checks |
@@ -584,7 +595,7 @@ The completed adversarial pass found and absorbed these failure modes:
 - [ ] `Alt+A` and `Option+Command+A` reach the same coordinator as the button, with user-visible registration failure.
 - [ ] One cursor monitor is frozen, the overlay never shows a live desktop, and selection cannot cross a monitor.
 - [ ] Every pictured selection, tool, color, width, history, and action behavior has an automated test.
-- [ ] Confirm produces one exact PNG `File` and exercises the unchanged `send-images` upload path once.
+- [ ] Confirm produces one exact PNG `File`, exercises the existing upload path once against the destination snapshotted before async work, and acknowledges only after success.
 - [ ] Save/copy succeed in packaged Windows/macOS/Linux tests; failure is retryable and non-destructive.
 - [ ] Capture imports no persistence, GraphQL, Yjs transport, AeorDB, Xenocept plugin, or phone code.
 - [ ] Pixel bytes never travel in JSON events, URLs, Pinia, logs, GraphQL, or persistent project state.
