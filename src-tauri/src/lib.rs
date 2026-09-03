@@ -26,6 +26,12 @@ pub fn run() {
             }
         }
     }));
+    let builder =
+        if let Some(plugin) = commands::screen_capture::shortcut::ordinary_shortcut_plugin() {
+            builder.plugin(plugin)
+        } else {
+            builder
+        };
     let app = builder
         .plugin(tauri_plugin_store::Builder::default().build())
         .plugin(
@@ -48,11 +54,64 @@ pub fn run() {
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
         .manage(commands::HttpClient::new())
         .manage(commands::media_preview_pool::MediaPreviewState::default())
+        .manage(commands::screen_capture::runtime::ScreenCaptureRuntime::default())
         .setup(|app| {
             #[cfg(target_os = "macos")]
             commands::macos_menu::setup(app)?;
+
+            #[cfg(target_os = "linux")]
+            match commands::screen_capture::shortcut::current_linux_shortcut_backend() {
+                commands::screen_capture::shortcut::LinuxShortcutBackend::OrdinaryPlugin => {
+                    if let Err(error) =
+                        commands::screen_capture::shortcut::register_ordinary_capture_shortcut(
+                            app.handle(),
+                        )
+                    {
+                        log::warn!("screen capture shortcut registration failed: {error}");
+                    }
+                }
+                commands::screen_capture::shortcut::LinuxShortcutBackend::WaylandPortalRequired => {
+                    let handle = app.handle().clone();
+                    tauri::async_runtime::spawn(async move {
+                        match commands::screen_capture::shortcut::register_wayland_portal_capture_shortcut(
+                            handle.clone(),
+                        )
+                        .await
+                        {
+                            Ok(guard) => {
+                                if !handle.manage(guard) {
+                                    log::warn!("Wayland capture shortcut guard was already installed");
+                                }
+                            }
+                            Err(error) => {
+                                log::warn!("Wayland capture shortcut registration failed: {error}");
+                            }
+                        }
+                    });
+                }
+            }
+
+            #[cfg(not(target_os = "linux"))]
+            if let Err(error) =
+                commands::screen_capture::shortcut::register_ordinary_capture_shortcut(app.handle())
+            {
+                log::warn!("screen capture shortcut registration failed: {error}");
+            }
+
+            {
+                let runtime = app
+                    .handle()
+                    .state::<commands::screen_capture::runtime::ScreenCaptureRuntime>();
+                let windows = commands::screen_capture::window::TauriCaptureWindowPort::new(
+                    app.handle().clone(),
+                );
+                if let Err(error) = runtime.ensure_overlay_native(&windows) {
+                    log::warn!("screen capture overlay prewarm failed: {error}");
+                }
+            }
 
             app.handle().manage(http_proxy::HttpProxyState::start());
             let data_dir = app
@@ -148,7 +207,29 @@ pub fn run() {
             app.handle().manage(local_server_state);
             Ok(())
         })
+        .on_page_load(|webview, payload| {
+            let app = webview.app_handle().clone();
+            let runtime = app.state::<commands::screen_capture::runtime::ScreenCaptureRuntime>();
+            let windows = commands::screen_capture::window::TauriCaptureWindowPort::new(app.clone());
+            let result = match payload.event() {
+                tauri::webview::PageLoadEvent::Started => {
+                    runtime.window_page_load_started(webview.label(), &windows)
+                }
+                tauri::webview::PageLoadEvent::Finished => {
+                    runtime.overlay_page_load_finished(webview.label(), &windows)
+                }
+            };
+            if let Err(error) = result {
+                log::warn!("screen capture overlay page lifecycle cleanup failed: {error}");
+            }
+        })
         .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { .. } = event {
+                commands::screen_capture::commands::on_window_close_requested(
+                    window.app_handle(),
+                    window.label(),
+                );
+            }
             // Remember the frame while the window is still alive so the
             // dock-icon reopen can put it back exactly where it was.
             #[cfg(target_os = "macos")]
@@ -159,6 +240,10 @@ pub fn run() {
                 );
             }
             if let tauri::WindowEvent::Destroyed = event {
+                commands::screen_capture::commands::on_window_destroyed(
+                    window.app_handle(),
+                    window.label(),
+                );
                 #[cfg(target_os = "macos")]
                 commands::macos_dock::remove_window_device_name(window.label());
                 // Any preview window dying (warm or visible) means we no
@@ -216,6 +301,24 @@ pub fn run() {
             commands::reveal::reveal_chat_file,
             commands::reveal::save_chat_file_as,
             commands::reveal::copy_chat_file_to_clipboard,
+            commands::screen_capture::commands::screen_capture_register_target,
+            commands::screen_capture::commands::screen_capture_unregister_target,
+            commands::screen_capture::commands::screen_capture_start,
+            commands::screen_capture::commands::screen_capture_ready,
+            commands::screen_capture::commands::screen_capture_take_frame,
+            commands::screen_capture::commands::screen_capture_frame_presented,
+            commands::screen_capture::commands::screen_capture_submit_result,
+            commands::screen_capture::commands::screen_capture_send_result,
+            commands::screen_capture::commands::screen_capture_take_result,
+            commands::screen_capture::commands::screen_capture_release_result,
+            commands::screen_capture::commands::screen_capture_ack_result,
+            commands::screen_capture::commands::screen_capture_save_result,
+            commands::screen_capture::commands::screen_capture_copy_result,
+            commands::screen_capture::commands::screen_capture_discard_result,
+            commands::screen_capture::commands::screen_capture_invalidate_target,
+            commands::screen_capture::commands::screen_capture_fail,
+            commands::screen_capture::commands::screen_capture_cancel,
+            commands::screen_capture::commands::screen_capture_unavailable,
             http_proxy::http_proxy_port,
             local::server::local_server_port,
             local::server::local_server_https_port,
