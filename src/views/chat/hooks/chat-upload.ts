@@ -19,14 +19,21 @@ export function messageNeedsDownload(item: IChatItem): boolean {
   return items.some((f: any) => typeof f.uri === 'string' && f.uri.startsWith('fsid:'))
 }
 
-export function useChatUpload(
-  chatId: ComputedRef<string>,
-  channelId: ComputedRef<string>,
-  appDir: string,
-  scrollBottom: () => void,
-  chatText: Ref<string>,
-  chatItems: Ref<IChatItem[]>,
-) {
+export interface ChatUploadDestination {
+  readonly chatId: string
+  readonly channelId: string
+  readonly appDir: string
+}
+
+export function snapshotChatUploadDestination(destination: ChatUploadDestination): ChatUploadDestination {
+  return Object.freeze({
+    chatId: destination.chatId,
+    channelId: destination.channelId,
+    appDir: destination.appDir,
+  })
+}
+
+export function useChatUpload(chatId: ComputedRef<string>, channelId: ComputedRef<string>, appDir: string, scrollBottom: () => void, chatText: Ref<string>, chatItems: Ref<IChatItem[]>) {
   const { t } = useI18n()
   const { getUploads } = useChatFilesUpload()
   const { enqueue: enqueueTask } = useTasks()
@@ -43,32 +50,52 @@ export function useChatUpload(
     return `${t('sending')} ${formatFileSize(agg.uploaded)} (${formatFileSize(agg.speed)}/s)`
   }
 
-  async function handleContentUpload(files: File[], contentType: MessageType, options: { summary?: string } = {}) {
-    const uploads = getUploads(appDir, files)
-    uploads.forEach((u) => { u.status = 'pending'; u.isAppFile = true })
+  function currentDestination(): ChatUploadDestination {
+    return snapshotChatUploadDestination({ chatId: chatId.value, channelId: channelId.value, appDir })
+  }
+
+  async function handleContentUpload(files: File[], contentType: MessageType, destination: ChatUploadDestination, options: { summary?: string } = {}) {
+    const frozenDestination = snapshotChatUploadDestination(destination)
+    const uploads = getUploads(frozenDestination.appDir, files)
+    uploads.forEach((u) => {
+      u.status = 'pending'
+      u.isAppFile = true
+    })
 
     const valueItems: any[] = []
     for (const upload of uploads) {
       const itemProps: any = {
-        dir: appDir, uri: upload.fileName || upload.file.name,
-        size: upload.file.size, duration: 0, width: 0, height: 0, summary: options.summary,
+        dir: frozenDestination.appDir,
+        uri: upload.fileName || upload.file.name,
+        size: upload.file.size,
+        duration: 0,
+        width: 0,
+        height: 0,
+        summary: options.summary,
       }
       if (upload.file.type.startsWith('video') || isVideo(upload.file.name)) {
         const v = await getVideoData(upload.file)
-        itemProps.duration = v.duration; itemProps.thumbnail = v.thumbnail; itemProps.width = v.width; itemProps.height = v.height
+        itemProps.duration = v.duration
+        itemProps.thumbnail = v.thumbnail
+        itemProps.width = v.width
+        itemProps.height = v.height
       } else if (upload.file.type.startsWith('image')) {
         const v = await getImageData(upload.file)
-        itemProps.width = v.width; itemProps.height = v.height
+        itemProps.width = v.width
+        itemProps.height = v.height
       }
       valueItems.push(itemProps)
     }
 
     const _content = { type: contentType, value: { items: valueItems } }
     const item: IChatItem = {
-      id: 'new_' + shortUUID(), fromId: 'me', toId: chatId.value, channelId: channelId.value,
-      createdAt: new Date().toISOString(), 
-      content: JSON.stringify(_content), 
-      _content, 
+      id: 'new_' + shortUUID(),
+      fromId: 'me',
+      toId: frozenDestination.chatId,
+      channelId: frozenDestination.channelId,
+      createdAt: new Date().toISOString(),
+      content: JSON.stringify(_content),
+      _content,
       __typename: 'ChatItem',
       data: { ids: uploads.map((it) => URL.createObjectURL(it.file)) },
     }
@@ -82,7 +109,7 @@ export function useChatUpload(
     uploading.value = [...uploading.value, ...uploads]
     const tempId = item.id
     chatItems.value = [...chatItems.value, item]
-    enqueueTask(item, uploads, chatId.value, (sentItem) => {
+    enqueueTask(item, uploads, frozenDestination.chatId, (sentItem) => {
       const normalized = normalizeChatItem(sentItem)
       chatItems.value = chatItems.value.filter((i) => i.id !== tempId)
       if (!chatItems.value.some((i) => i.id === normalized.id)) {
@@ -94,20 +121,18 @@ export function useChatUpload(
   }
 
   async function doUploadFiles(files: File[]) {
-    if (files.length) await handleContentUpload(files, MessageType.FILES)
+    if (files.length) await handleContentUpload(files, MessageType.FILES, currentDestination())
   }
 
-  async function doUploadImages(files: File[]) {
-    if (files.length) await handleContentUpload(files, MessageType.IMAGES)
+  async function doUploadImages(files: File[], destination: ChatUploadDestination = currentDestination()) {
+    if (files.length) await handleContentUpload(files, MessageType.IMAGES, destination)
   }
 
   async function sendLongMessageAsFile(message: string) {
     const file = new File([message], `message-${Date.now()}.txt`, { type: 'text/plain' })
     const summaryText = message.substring(0, 250).trim()
-    const summary = summaryText.lastIndexOf(' ') > 230
-      ? summaryText.substring(0, summaryText.lastIndexOf(' ')) + '...'
-      : summaryText + '...'
-    await handleContentUpload([file], MessageType.FILES, { summary })
+    const summary = summaryText.lastIndexOf(' ') > 230 ? summaryText.substring(0, summaryText.lastIndexOf(' ')) + '...' : summaryText + '...'
+    await handleContentUpload([file], MessageType.FILES, currentDestination(), { summary })
     chatText.value = ''
   }
 
@@ -131,15 +156,27 @@ export function useChatUpload(
   }
 
   async function pausePeerDownload(messageId: string) {
-    try { await gqlFetch(pauseDownloadGQL, { messageId }) } catch { /* */ }
+    try {
+      await gqlFetch(pauseDownloadGQL, { messageId })
+    } catch {
+      /* */
+    }
   }
 
   async function resumePeerDownload(messageId: string, peerId: string) {
-    try { await gqlFetch(resumeDownloadGQL, { messageId, peerId }) } catch { /* */ }
+    try {
+      await gqlFetch(resumeDownloadGQL, { messageId, peerId })
+    } catch {
+      /* */
+    }
   }
 
   async function retryPeerDownload(messageId: string, peerId: string) {
-    try { await gqlFetch(retryDownloadGQL, { messageId, peerId }) } catch { /* */ }
+    try {
+      await gqlFetch(retryDownloadGQL, { messageId, peerId })
+    } catch {
+      /* */
+    }
   }
 
   function handleDownloadAction(messageId: string, action: 'pause' | 'resume' | 'retry') {
@@ -152,16 +189,20 @@ export function useChatUpload(
 
   // Auto-trigger download for peer messages with fsid: URIs (mirrors
   // plain-app ChatImageItem's LaunchedEffect).
-  watch(chatItems, (items) => {
-    for (const item of items) {
-      if (item.id.startsWith('new_')) continue
-      if (downloadProgress[item.id]) continue
-      if (!messageNeedsDownload(item)) continue
-      const peerId = getPeerIdForItem(item)
-      if (!peerId) continue
-      triggerPeerDownload(item.id, peerId)
-    }
-  }, { flush: 'post' })
+  watch(
+    chatItems,
+    (items) => {
+      for (const item of items) {
+        if (item.id.startsWith('new_')) continue
+        if (downloadProgress[item.id]) continue
+        if (!messageNeedsDownload(item)) continue
+        const peerId = getPeerIdForItem(item)
+        if (!peerId) continue
+        triggerPeerDownload(item.id, peerId)
+      }
+    },
+    { flush: 'post' }
+  )
 
   // Event bus handlers
   const handlers: Record<string, (...args: any[]) => any> = {}
@@ -187,11 +228,15 @@ export function useChatUpload(
         newProgress[msgId].downloaded += item.downloaded
         newProgress[msgId].total += item.total
         newProgress[msgId].speed += item.speed
-        const s = item.status; const cur = newProgress[msgId].status
+        const s = item.status
+        const cur = newProgress[msgId].status
         if (s === 'DOWNLOADING') newProgress[msgId].status = 'DOWNLOADING'
         else if (s === 'PAUSED' && cur !== 'DOWNLOADING') newProgress[msgId].status = 'PAUSED'
         else if (s === 'FAILED' && cur === 'PENDING') newProgress[msgId].status = 'FAILED'
-        else if (s === 'COMPLETED') { newProgress[msgId].status = 'COMPLETED'; submittedDownloads.delete(msgId) }
+        else if (s === 'COMPLETED') {
+          newProgress[msgId].status = 'COMPLETED'
+          submittedDownloads.delete(msgId)
+        }
       }
       // Drop completed entries so the overlay disappears.
       for (const key of Object.keys(newProgress)) {
