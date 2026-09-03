@@ -1,6 +1,6 @@
 <!-- eslint-disable vue/no-v-html -->
 <template>
-  <div class="chat-input">
+  <div class="chat-input" :class="{ 'capture-enabled': isTauri }">
     <div class="textarea-wrapper" @dragenter="fileDragEnter" @dragover="fileDragOver" @dragleave="fileDragLeave" @drop="dropFiles">
       <div v-show="displayDragMask" class="drag-mask">{{ $t('release_to_send_files') }}</div>
       <EmojiTextField

@@ -72,17 +72,27 @@
       <button type="button" class="capture-toolbar__button" data-action="cancel" :aria-label="messages.actions.cancel" :title="messages.actions.cancel" :disabled="busy" @click="$emit('cancel')">
         ×
       </button>
-      <button
-        type="button"
-        class="capture-toolbar__button capture-toolbar__confirm"
-        data-action="confirm"
-        :aria-label="messages.actions.confirm"
-        :title="canConfirm ? messages.actions.confirm : messages.actions.openChatToSend"
-        :disabled="busy || !canConfirm"
-        @click="$emit('action', 'confirm')"
+      <span
+        class="capture-toolbar__tooltip-host"
+        data-testid="capture-confirm-tooltip-host"
+        :tabindex="!canConfirm && !busy ? 0 : undefined"
       >
-        ✓
-      </button>
+        <button
+          type="button"
+          class="capture-toolbar__button capture-toolbar__confirm"
+          data-action="confirm"
+          :aria-label="messages.actions.confirm"
+          :aria-describedby="!canConfirm ? 'capture-confirm-disabled-reason' : undefined"
+          :title="canConfirm ? messages.actions.confirm : messages.actions.openChatToSend"
+          :disabled="busy || !canConfirm"
+          @click="$emit('action', 'confirm')"
+        >
+          ✓
+        </button>
+        <span v-if="!canConfirm" id="capture-confirm-disabled-reason" class="capture-toolbar__tooltip" role="tooltip">
+          {{ messages.actions.openChatToSend }}
+        </span>
+      </span>
     </div>
   </div>
 </template>
@@ -246,5 +256,48 @@ function strokeWidthLabel(width: number): string {
 
 .capture-toolbar__confirm:hover:not(:disabled) {
   background: #86efac;
+}
+
+.capture-toolbar__tooltip-host {
+  position: relative;
+  display: grid;
+  place-items: center;
+  border-radius: 5px;
+  outline: none;
+}
+
+.capture-toolbar__tooltip-host:focus-visible {
+  outline: 2px solid #60a5fa;
+  outline-offset: 1px;
+}
+
+.capture-toolbar__tooltip {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 8px);
+  z-index: 10;
+  width: max-content;
+  max-width: 240px;
+  padding: 6px 9px;
+  color: #f8fafc;
+  font: 500 12px/1.35 system-ui, sans-serif;
+  text-align: left;
+  white-space: normal;
+  pointer-events: none;
+  visibility: hidden;
+  opacity: 0;
+  background: rgb(24 24 27 / 98%);
+  border: 1px solid rgb(255 255 255 / 18%);
+  border-radius: 6px;
+  box-shadow: 0 5px 18px rgb(0 0 0 / 42%);
+  transition:
+    opacity 120ms ease,
+    visibility 120ms ease;
+}
+
+.capture-toolbar__tooltip-host:hover .capture-toolbar__tooltip,
+.capture-toolbar__tooltip-host:focus-visible .capture-toolbar__tooltip {
+  visibility: visible;
+  opacity: 1;
 }
 </style>

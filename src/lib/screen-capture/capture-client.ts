@@ -1,6 +1,11 @@
-export const CAPTURE_RESULT_AVAILABLE_EVENT = 'screen-capture://result-available'
-export const CAPTURE_SESSION_STARTED_EVENT = 'screen-capture://session-started'
-export const CAPTURE_SESSION_ENDED_EVENT = 'screen-capture://session-ended'
+import {
+  CAPTURE_RESULT_AVAILABLE_EVENT,
+  CAPTURE_SESSION_STARTED_EVENT,
+  CAPTURE_TARGET_SESSION_ENDED_EVENT,
+} from './capture-events'
+
+export { CAPTURE_RESULT_AVAILABLE_EVENT, CAPTURE_SESSION_STARTED_EVENT }
+export const CAPTURE_SESSION_ENDED_EVENT = CAPTURE_TARGET_SESSION_ENDED_EVENT
 
 const MAX_RESULT_BYTES = 160 * 1024 * 1024
 const PNG_SIGNATURE = [137, 80, 78, 71, 13, 10, 26, 10] as const

@@ -17,6 +17,7 @@ use super::platform::XcapBackend;
 use super::runtime::{
     CapturePublishOutcome, CaptureStartResponse, CaptureTicket, CaptureTimeoutKind,
     OVERLAY_WINDOW_LABEL, OverlayInit, ScreenCaptureRuntime, acquire_and_publish_once,
+    is_regular_window_label,
 };
 use super::window::TauriCaptureWindowPort;
 
@@ -24,14 +25,59 @@ pub const RESULT_SESSION_HEADER: &str = "x-plain-capture-session-id";
 pub const RESULT_GENERATION_HEADER: &str = "x-plain-capture-overlay-generation";
 pub const RESULT_WIDTH_HEADER: &str = "x-plain-capture-width";
 pub const RESULT_HEIGHT_HEADER: &str = "x-plain-capture-height";
+const MAX_CLIENT_ERROR_DETAIL_CHARS: usize = 1024;
 const CAPTURE_READINESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const CAPTURE_LIFETIME_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+// `WebviewWindow::hide` acknowledges the unmap request, not completion of the
+// desktop compositor's fade-out. 100 ms still captured a partially faded
+// origin under X11/KWin; allow the animation to finish before reading pixels.
+#[cfg(target_os = "linux")]
+const COMPOSITOR_UNMAP_SETTLE: Duration = Duration::from_millis(250);
+#[cfg(not(target_os = "linux"))]
 const COMPOSITOR_UNMAP_SETTLE: Duration = Duration::from_millis(100);
 const CAPTURE_BACKEND_TIMEOUT: Duration = Duration::from_secs(135);
 #[cfg(target_os = "linux")]
 const PORTAL_INTERACTION_TIMEOUT: Duration = Duration::from_secs(120);
 #[cfg(target_os = "linux")]
 const PORTAL_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn bounded_client_error_detail(detail: &str) -> String {
+    let sanitized: String = detail
+        .chars()
+        .take(MAX_CLIENT_ERROR_DETAIL_CHARS)
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect();
+    if sanitized.trim().is_empty() {
+        "screen capture client reported an unspecified failure".to_string()
+    } else {
+        sanitized
+    }
+}
+
+#[tauri::command]
+pub fn screen_capture_report_client_error(
+    window: WebviewWindow,
+    detail: String,
+) -> Result<(), CaptureError> {
+    if !is_regular_window_label(window.label()) {
+        return Err(CaptureError::new(
+            CaptureErrorCode::UnauthorizedCaller,
+            "only a regular application window may report a capture client failure",
+        ));
+    }
+    log::error!(
+        "screen capture client [{}]: {}",
+        window.label(),
+        bounded_client_error_detail(&detail)
+    );
+    Ok(())
+}
 
 #[tauri::command]
 pub fn screen_capture_register_target(
@@ -537,7 +583,20 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{new_capture_delivery_lease_id, new_capture_result_id, new_capture_session_id};
+    use super::{
+        MAX_CLIENT_ERROR_DETAIL_CHARS, bounded_client_error_detail,
+        new_capture_delivery_lease_id, new_capture_result_id, new_capture_session_id,
+    };
+
+    #[test]
+    fn client_error_detail_is_bounded_and_cannot_forge_log_lines() {
+        assert_eq!(bounded_client_error_detail("failure\nforged\tline"), "failure forged line");
+        assert_eq!(bounded_client_error_detail("\n\t"), "screen capture client reported an unspecified failure");
+        assert_eq!(
+            bounded_client_error_detail(&"x".repeat(MAX_CLIENT_ERROR_DETAIL_CHARS + 1)).chars().count(),
+            MAX_CLIENT_ERROR_DETAIL_CHARS
+        );
+    }
 
     #[test]
     fn native_session_ids_are_nonempty_and_not_reused() {

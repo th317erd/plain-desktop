@@ -22,6 +22,7 @@ pub const RESULT_AVAILABLE_EVENT: &str = "screen-capture://result-available";
 pub const DELIVERY_FAILED_EVENT: &str = "screen-capture://delivery-failed";
 pub const SESSION_STARTED_EVENT: &str = "screen-capture://session-started";
 pub const SESSION_ENDED_EVENT: &str = "screen-capture://session-ended";
+pub const OVERLAY_SESSION_ENDED_EVENT: &str = "screen-capture://overlay-session-ended";
 pub const TARGET_UNAVAILABLE_EVENT: &str = "screen-capture://target-unavailable";
 pub const CAPTURE_PROTOCOL_VERSION: u32 = 1;
 pub const MAX_JS_SAFE_INTEGER: u64 = 9_007_199_254_740_991;

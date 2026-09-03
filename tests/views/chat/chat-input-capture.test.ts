@@ -5,6 +5,7 @@ import ChatInput from '@/views/chat/ChatInput.vue'
 import chatInputSource from '@/views/chat/ChatInput.vue?raw'
 import chatViewSource from '@/views/chat/ChatView.vue?raw'
 import tauriAdapterSource from '@/lib/screen-capture/tauri-capture-adapter.ts?raw'
+import chatStylesSource from '@/styles/_chat.scss?raw'
 
 vi.mock('vue-i18n', () => ({ useI18n: () => ({ t: (key: string) => key }) }))
 
@@ -19,6 +20,12 @@ describe('ChatInput screen capture action', () => {
     expect(chatInputSource).not.toContain('screen-capture/tauri-capture-adapter')
     expect(chatInputSource.indexOf('@click="sendImages"')).toBeLessThan(chatInputSource.indexOf('@click="sendFiles"'))
     expect(chatInputSource.indexOf('@click="sendFiles"')).toBeLessThan(chatInputSource.indexOf('@click="$emit(\'request-capture\')"'))
+  })
+
+  it('lays out all three Tauri composer actions without clipping the capture button', () => {
+    expect(chatInputSource).toContain("'capture-enabled': isTauri")
+    expect(chatStylesSource).toMatch(/\.chat-input\.capture-enabled[\s\S]*?\.leading-icons\s*\{[\s\S]*?flex-direction:\s*row/)
+    expect(chatStylesSource).toMatch(/\.chat-input\.capture-enabled[\s\S]*?\.field-input\s*\{[\s\S]*?padding-left:\s*128px/)
   })
 
   it('keeps the web graph free of eager Tauri loading and wires view lifecycle ownership', () => {

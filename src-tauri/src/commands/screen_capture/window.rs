@@ -8,10 +8,10 @@ use tauri::{
 use super::contract::{CaptureError, CaptureErrorCode, MonitorGeometry};
 use super::runtime::{
     CaptureWindowPort, CaptureWindowState, DELIVERY_FAILED_EVENT, DeliveryFailedPayload,
-    FRAME_AVAILABLE_EVENT, FrameAvailablePayload, OverlayConcealment, OverlaySessionEndedPayload,
-    OverlayWindowSpec, RESULT_AVAILABLE_EVENT, ResultAvailablePayload, SESSION_ENDED_EVENT,
-    SESSION_STARTED_EVENT, ScreenCaptureRuntime, SessionEndedPayload, SessionStartedPayload,
-    TARGET_UNAVAILABLE_EVENT, TargetUnavailablePayload,
+    FRAME_AVAILABLE_EVENT, FrameAvailablePayload, OVERLAY_SESSION_ENDED_EVENT, OverlayConcealment,
+    OverlaySessionEndedPayload, OverlayWindowSpec, RESULT_AVAILABLE_EVENT, ResultAvailablePayload,
+    SESSION_ENDED_EVENT, SESSION_STARTED_EVENT, ScreenCaptureRuntime, SessionEndedPayload,
+    SessionStartedPayload, TARGET_UNAVAILABLE_EVENT, TargetUnavailablePayload,
 };
 
 /// The production implementation of the small synchronous window interface
@@ -332,7 +332,7 @@ impl<R: Runtime> CaptureWindowPort for TauriCaptureWindowPort<R> {
             ));
         }
         self.app
-            .emit_to(label, SESSION_ENDED_EVENT, payload.clone())
+            .emit_to(label, OVERLAY_SESSION_ENDED_EVENT, payload.clone())
             .map_err(|error| overlay_error("publish overlay capture completion metadata", error))
     }
 }

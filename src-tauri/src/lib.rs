@@ -315,6 +315,7 @@ pub fn run() {
             commands::screen_capture::commands::screen_capture_save_result,
             commands::screen_capture::commands::screen_capture_copy_result,
             commands::screen_capture::commands::screen_capture_discard_result,
+            commands::screen_capture::commands::screen_capture_report_client_error,
             commands::screen_capture::commands::screen_capture_invalidate_target,
             commands::screen_capture::commands::screen_capture_fail,
             commands::screen_capture::commands::screen_capture_cancel,

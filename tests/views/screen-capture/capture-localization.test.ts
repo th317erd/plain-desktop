@@ -115,6 +115,10 @@ describe('capture-only localization', () => {
     expect(wrapper.get('[data-tool="rect"]').attributes('aria-label')).toBe('Rectángulo')
     expect(wrapper.get('[data-action="save"]').attributes('aria-label')).toBe('Guardar')
     expect(wrapper.get('[data-action="confirm"]').attributes('title')).toBe('Abre un chat para enviar')
+    expect(wrapper.get('[data-testid="capture-confirm-tooltip-host"]').attributes('tabindex')).toBe('0')
+    expect(wrapper.get('[data-action="confirm"]').attributes('aria-describedby')).toBe('capture-confirm-disabled-reason')
+    expect(wrapper.get('#capture-confirm-disabled-reason').attributes('role')).toBe('tooltip')
+    expect(wrapper.get('#capture-confirm-disabled-reason').text()).toBe('Abre un chat para enviar')
     wrapper.unmount()
   })
 

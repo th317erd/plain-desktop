@@ -214,6 +214,62 @@ The following P0 gates also remain open until appropriate hosts/CI or packaged b
 - Packaged native clipboard ownership/persistence and save-dialog behavior.
 - Successful cross-platform GitHub check/release runs and smoke-tested produced packages.
 
+## KDE/X11 assembled-runtime evidence (2026-09-03)
+
+A production-mode binary built with the pinned Rust 1.96 toolchain was launched
+on KDE Plasma/X11 and exercised against the local chat service:
+
+- The composer scissors action and `Alt+A` both opened the annotation overlay.
+- Selection, annotation, PNG rendering, native result handoff, upload, and chat
+  insertion completed end to end.
+- A 100 ms origin-window delay captured a partially faded Plain window under
+  KWin. Raising only the Linux compositor-unmap settle to 250 ms removed the
+  origin window from the captured frame; Windows and macOS retain 100 ms.
+- The first successful upload still displayed a false `Failed` toast. Native
+  diagnostics identified an `invalid_result` in the main webview after the
+  upload had completed. The target lifecycle and overlay lifecycle were both
+  using `screen-capture://session-ended` with incompatible payloads; Tauri's
+  application-level event delivery allowed the target client to consume the
+  overlay payload. The two lifecycles now use distinct event names, with a
+  regression test asserting the target client never subscribes to the overlay
+  terminal channel.
+- The hidden `media-preview-warm` utility webview also attempted to register
+  as a capture target. Capture initialization now rejects every label except
+  `main` and non-empty `window-*` labels before installing listeners or
+  touching the native registry.
+- After those corrections, an end-to-end capture uploaded and appeared in
+  local chat with no error toast and no capture diagnostic in the application
+  log. The two diagnostic captures created by automated verification were
+  removed afterward.
+
+The same assembled build exposes capture in the SMS/Messages composer and
+routes the frozen PNG through the existing MMS send path while preserving the
+user's text and attachment draft. That integration has component/unit proof;
+an actual carrier MMS send remains a device/runtime gate.
+
+Current focused evidence after the corrections:
+
+```text
+VITE_APP_MODE=tauri corepack yarn test <capture/chat/message test set>
+  166 passed
+
+RUSTUP_TOOLCHAIN=1.96.0 cargo test --manifest-path src-tauri/Cargo.toml screen_capture --locked
+  108 passed
+
+VITE_APP_MODE=tauri corepack yarn typecheck
+  passed
+
+corepack yarn eslint <changed frontend files>
+  passed
+
+corepack yarn build
+VITE_APP_MODE=tauri corepack yarn build
+  passed
+
+corepack yarn test
+  692 passed; 52 skipped; only the same 3 allowlisted baseline failures
+```
+
 ## Xenocept provenance
 
 Xenocept source was audited at private commit `35efe0e` with the repository owner's explicit permission. P0 adapts its backend/coordinator separation and evidence about platform failure modes. No Xenocept source file was copied in this phase. Its older dependency pins (`xcap` 0.8.3, shortcut plugin 2.3.1, `ashpd` 0.11.1), canvas editor, AeorDB, plugin system, HTTP/eval transport, radial UI, and persisted screenshot history are intentionally excluded.

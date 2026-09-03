@@ -101,6 +101,13 @@ function showCaptureError() {
   toast(t('failed'), 'error')
 }
 
+function showCaptureRequestError(context: string, error: unknown) {
+  void import('@/lib/screen-capture/tauri-capture-adapter')
+    .then((adapter) => adapter.reportTauriCaptureError(context, error))
+    .catch(() => console.error(context, error))
+  showCaptureError()
+}
+
 async function loadCaptureTarget(): Promise<ChatCaptureTarget> {
   if (!__IS_TAURI__) throw new Error('screen capture is available only in the desktop app')
   if (!captureTargetPromise) {
@@ -127,8 +134,8 @@ async function activateCaptureTarget(activation: number) {
     const target = await loadCaptureTarget()
     if (captureDisposed || !isActive.value || notAllowChat.value || activation !== captureActivation) return
     target.activate(currentCaptureDestination())
-  } catch {
-    if (!captureDisposed && isActive.value && !notAllowChat.value && activation === captureActivation) showCaptureError()
+  } catch (error) {
+    if (!captureDisposed && isActive.value && !notAllowChat.value && activation === captureActivation) showCaptureRequestError('chat capture target activation failed', error)
   }
 }
 
@@ -138,8 +145,8 @@ async function handleCaptureRequest() {
     const target = await loadCaptureTarget()
     if (captureDisposed || !isActive.value || notAllowChat.value || activation !== captureActivation) return
     await target.start(currentCaptureDestination())
-  } catch {
-    if (!captureDisposed && isActive.value && !notAllowChat.value && activation === captureActivation) showCaptureError()
+  } catch (error) {
+    if (!captureDisposed && isActive.value && !notAllowChat.value && activation === captureActivation) showCaptureRequestError('chat capture request failed', error)
   }
 }
 

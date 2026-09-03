@@ -12,11 +12,11 @@ import {
 import { captureMessagesForLanguages, type CaptureMessages } from './capture-localization'
 import type { CaptureFrameAvailable, CaptureInvoke, CaptureListen } from './capture-transport'
 import { createCaptureTransport, parseOverlayGeneration } from './capture-transport'
+import { CAPTURE_OVERLAY_SESSION_ENDED_EVENT } from '@/lib/screen-capture/capture-events'
 import './screen-capture.scss'
 
 const TARGET_UNAVAILABLE_EVENT = 'screen-capture://target-unavailable'
 const DELIVERY_FAILED_EVENT = 'screen-capture://delivery-failed'
-const SESSION_ENDED_EVENT = 'screen-capture://session-ended'
 
 function mountOverlay(root: HTMLElement, image: ImageData, options: CaptureOverlayMountOptions, messages: CaptureMessages): CaptureOverlayMount {
   const canConfirm = ref(options.canConfirm)
@@ -111,7 +111,7 @@ export async function bootstrapScreenCapture(): Promise<void> {
       })
     )
     unlisteners.push(
-      await listen<CaptureOverlaySessionEnded>(SESSION_ENDED_EVENT, ({ payload }) => {
+      await listen<CaptureOverlaySessionEnded>(CAPTURE_OVERLAY_SESSION_ENDED_EVENT, ({ payload }) => {
         overlaySession.sessionEnded(payload)
       })
     )

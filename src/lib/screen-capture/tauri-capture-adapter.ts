@@ -1,4 +1,4 @@
-import { getCaptureClient, type CaptureClient, type CaptureClientError, type CaptureConsumerRegistration, type CaptureStartResponse } from './capture-client'
+import { CaptureClientError, getCaptureClient, type CaptureClient, type CaptureConsumerRegistration, type CaptureStartResponse } from './capture-client'
 
 export interface ChatCaptureDestination {
   readonly chatId: string
@@ -13,6 +13,46 @@ export interface ChatCaptureTarget {
   deactivate(): void
   start(destination: ChatCaptureDestination): Promise<CaptureStartResponse>
   dispose(): void
+}
+
+function errorDetail(error: unknown, depth = 0, seen = new Set<object>()): string {
+  if (depth >= 4) return '[cause depth exceeded]'
+  if (error instanceof Error) {
+    if (seen.has(error)) return '[circular error cause]'
+    seen.add(error)
+    const own = `${error.name}: ${error.message}`
+    return error.cause === undefined ? own : `${own}; cause: ${errorDetail(error.cause, depth + 1, seen)}`
+  }
+  if (typeof error === 'string') return error
+  try {
+    return JSON.stringify(error)
+  } catch {
+    return String(error)
+  }
+}
+
+export function formatCaptureClientError(error: CaptureClientError): string {
+  const cause = error.cause === undefined ? '' : `; cause: ${errorDetail(error.cause)}`
+  return `${error.code}: ${error.message}${cause}`.slice(0, 1024)
+}
+
+export function isRegularCaptureWindowLabel(label: string): boolean {
+  return label === 'main' || (label.startsWith('window-') && label.length > 'window-'.length)
+}
+
+async function invokeCaptureErrorReport(detail: string): Promise<void> {
+  const [{ invoke }, { getCurrentWindow }] = await Promise.all([import('@tauri-apps/api/core'), import('@tauri-apps/api/window')])
+  if (!isRegularCaptureWindowLabel(getCurrentWindow().label)) return
+  await invoke('screen_capture_report_client_error', { detail: detail.slice(0, 1024) })
+}
+
+export async function reportTauriCaptureError(context: string, error: unknown): Promise<void> {
+  const detail = `${context}: ${errorDetail(error)}`.slice(0, 1024)
+  try {
+    await invokeCaptureErrorReport(detail)
+  } catch {
+    console.error(detail, error)
+  }
 }
 
 function requireNonBlank(value: string, field: string): void {
@@ -97,13 +137,26 @@ export function createChatCaptureTarget(client: CaptureClient, consume: ChatCapt
 /** Load and install the per-webview client without any eager Tauri imports. */
 export async function getTauriCaptureClient(onError: (error: CaptureClientError) => void): Promise<CaptureClient> {
   const [{ invoke }, { listen }, { getCurrentWindow }] = await Promise.all([import('@tauri-apps/api/core'), import('@tauri-apps/api/event'), import('@tauri-apps/api/window')])
+  const windowLabel = getCurrentWindow().label
+  if (!isRegularCaptureWindowLabel(windowLabel)) {
+    throw new CaptureClientError('target_unavailable', 'screen capture is unavailable in utility windows')
+  }
   return getCaptureClient({
-    windowLabel: getCurrentWindow().label,
+    windowLabel,
     invoke,
     listen: async (event, handler) =>
       listen(event, (incoming) => {
         void handler({ payload: incoming.payload })
       }),
-    onError,
+    onError: (error) => {
+      const message = `screen capture client failure: ${formatCaptureClientError(error)}`
+      // Route diagnostics through an application command. Calling the log
+      // plugin directly can be rejected by a production capability policy,
+      // which previously reduced every failure to an unactionable toast.
+      void invokeCaptureErrorReport(message).catch(() => {
+        console.error(message, error)
+      })
+      onError(error)
+    },
   })
 }

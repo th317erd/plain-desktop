@@ -13,6 +13,7 @@ import {
   type CaptureSessionEnded,
   type CaptureSessionStarted,
 } from '@/lib/screen-capture/capture-client'
+import { CAPTURE_OVERLAY_SESSION_ENDED_EVENT } from '@/lib/screen-capture/capture-events'
 
 const PNG_BYTES = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10, 1, 2, 3, 4])
 
@@ -101,6 +102,17 @@ async function startedHarness(consumer = vi.fn(async (_file: File) => undefined)
 }
 
 describe('CaptureClient target ownership', () => {
+  it('does not subscribe the target client to overlay terminal payloads', async () => {
+    const test = harness()
+    const registration = test.client.registerConsumer(async () => undefined)
+    registration.activate()
+    await test.client.startComposerCapture()
+
+    expect(CAPTURE_SESSION_ENDED_EVENT).not.toBe(CAPTURE_OVERLAY_SESSION_ENDED_EVENT)
+    expect(test.order).toContain(`listen:${CAPTURE_SESSION_ENDED_EVENT}`)
+    expect(test.order).not.toContain(`listen:${CAPTURE_OVERLAY_SESSION_ENDED_EVENT}`)
+  })
+
   it('publishes only the opaque active token to the trusted native target registry', async () => {
     const test = harness()
     const registration = test.client.registerConsumer(async () => undefined)

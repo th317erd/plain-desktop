@@ -1,6 +1,12 @@
 import { describe, expect, it, vi } from 'vitest'
-import { createChatCaptureTarget, snapshotChatCaptureDestination, type ChatCaptureDestination } from '@/lib/screen-capture/tauri-capture-adapter'
-import type { CaptureClient, CaptureConsumerRegistration } from '@/lib/screen-capture/capture-client'
+import {
+  createChatCaptureTarget,
+  formatCaptureClientError,
+  isRegularCaptureWindowLabel,
+  snapshotChatCaptureDestination,
+  type ChatCaptureDestination,
+} from '@/lib/screen-capture/tauri-capture-adapter'
+import { CaptureClientError, type CaptureClient, type CaptureConsumerRegistration } from '@/lib/screen-capture/capture-client'
 
 function harness() {
   const registrations: Array<{
@@ -105,5 +111,29 @@ describe('chat capture target ownership', () => {
     expect(() => target.activate({ chatId: 'peer:second', channelId: '', appDir: '/app' })).toThrow('registration failed')
     await expect(target.start(first)).rejects.toThrow('not active')
     expect(test.startComposerCapture).not.toHaveBeenCalled()
+  })
+})
+
+describe('capture client diagnostics', () => {
+  it('excludes utility webviews from capture target registration', () => {
+    expect(isRegularCaptureWindowLabel('main')).toBe(true)
+    expect(isRegularCaptureWindowLabel('window-chat')).toBe(true)
+    expect(isRegularCaptureWindowLabel('window-')).toBe(false)
+    expect(isRegularCaptureWindowLabel('media-preview-warm')).toBe(false)
+    expect(isRegularCaptureWindowLabel('screen-capture-overlay')).toBe(false)
+  })
+
+  it('retains the bounded nested cause that identifies a failed delivery stage', () => {
+    const error = new CaptureClientError('consumer_failed', 'the capture consumer rejected the PNG', new Error('upload returned no file hash'))
+
+    expect(formatCaptureClientError(error)).toBe('consumer_failed: the capture consumer rejected the PNG; cause: Error: upload returned no file hash')
+    expect(formatCaptureClientError(new CaptureClientError('invalid_result', 'x'.repeat(2_000)))).toHaveLength(1_024)
+  })
+
+  it('bounds cyclic error causes instead of dropping the diagnostic callback', () => {
+    const cause = new Error('cycle')
+    cause.cause = cause
+
+    expect(formatCaptureClientError(new CaptureClientError('consumer_failed', 'consumer rejected PNG', cause))).toContain('[circular error cause]')
   })
 })
