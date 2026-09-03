@@ -1,6 +1,6 @@
 <template>
-  <div class="capture-toolbar" role="toolbar" aria-label="Screen capture tools" @pointerdown.stop @dblclick.stop @contextmenu.stop.prevent>
-    <div class="capture-toolbar__group" aria-label="Annotation tools">
+  <div class="capture-toolbar" role="toolbar" :aria-label="messages.a11y.toolbar" @pointerdown.stop @dblclick.stop @contextmenu.stop.prevent>
+    <div class="capture-toolbar__group" :aria-label="messages.a11y.annotationTools">
       <button
         v-for="tool in tools"
         :key="tool.id"
@@ -20,12 +20,12 @@
 
     <span class="capture-toolbar__divider" aria-hidden="true" />
 
-    <div class="capture-toolbar__group" aria-label="History">
-      <button type="button" class="capture-toolbar__button" aria-label="Undo" title="Undo" :disabled="busy || !canUndo" @click="$emit('undo')">↶</button>
-      <button type="button" class="capture-toolbar__button" aria-label="Redo" title="Redo" :disabled="busy || !canRedo" @click="$emit('redo')">↷</button>
+    <div class="capture-toolbar__group" :aria-label="messages.a11y.history">
+      <button type="button" class="capture-toolbar__button" :aria-label="messages.actions.undo" :title="messages.actions.undo" :disabled="busy || !canUndo" @click="$emit('undo')">↶</button>
+      <button type="button" class="capture-toolbar__button" :aria-label="messages.actions.redo" :title="messages.actions.redo" :disabled="busy || !canRedo" @click="$emit('redo')">↷</button>
     </div>
 
-    <div class="capture-toolbar__group capture-toolbar__colors" aria-label="Colors">
+    <div class="capture-toolbar__group capture-toolbar__colors" :aria-label="messages.a11y.colors">
       <button
         v-for="preset in colors"
         :key="preset"
@@ -34,15 +34,15 @@
         :class="{ active: color === preset }"
         :style="{ '--capture-color': preset }"
         :data-color="preset"
-        :aria-label="`Color ${preset}`"
-        :title="`Color ${preset}`"
+        :aria-label="colorLabel(preset)"
+        :title="colorLabel(preset)"
         :aria-pressed="color === preset"
         :disabled="busy"
         @click="$emit('color', preset)"
       />
     </div>
 
-    <div class="capture-toolbar__group" aria-label="Stroke width">
+    <div class="capture-toolbar__group" :aria-label="messages.a11y.strokeWidth">
       <button
         v-for="width in strokeWidths"
         :key="width"
@@ -50,8 +50,8 @@
         class="capture-toolbar__stroke"
         :class="{ active: strokeWidth === width }"
         :data-stroke-width="width"
-        :aria-label="`Stroke width ${width}`"
-        :title="`Stroke width ${width}`"
+        :aria-label="strokeWidthLabel(width)"
+        :title="strokeWidthLabel(width)"
         :aria-pressed="strokeWidth === width"
         :disabled="busy"
         @click="$emit('stroke-width', width)"
@@ -62,16 +62,22 @@
 
     <span class="capture-toolbar__divider" aria-hidden="true" />
 
-    <div class="capture-toolbar__group" aria-label="Capture actions">
-      <button type="button" class="capture-toolbar__button" data-action="save" aria-label="Save" title="Save" :disabled="busy" @click="$emit('action', 'save')">⇩</button>
-      <button type="button" class="capture-toolbar__button" data-action="copy" aria-label="Copy" title="Copy" :disabled="busy" @click="$emit('action', 'copy')">⧉</button>
-      <button type="button" class="capture-toolbar__button" data-action="cancel" aria-label="Cancel" title="Cancel" :disabled="busy" @click="$emit('cancel')">×</button>
+    <div class="capture-toolbar__group" :aria-label="messages.a11y.actions">
+      <button type="button" class="capture-toolbar__button" data-action="save" :aria-label="messages.actions.save" :title="messages.actions.save" :disabled="busy" @click="$emit('action', 'save')">
+        ⇩
+      </button>
+      <button type="button" class="capture-toolbar__button" data-action="copy" :aria-label="messages.actions.copy" :title="messages.actions.copy" :disabled="busy" @click="$emit('action', 'copy')">
+        ⧉
+      </button>
+      <button type="button" class="capture-toolbar__button" data-action="cancel" :aria-label="messages.actions.cancel" :title="messages.actions.cancel" :disabled="busy" @click="$emit('cancel')">
+        ×
+      </button>
       <button
         type="button"
         class="capture-toolbar__button capture-toolbar__confirm"
         data-action="confirm"
-        aria-label="Confirm"
-        :title="canConfirm ? 'Confirm' : 'Open a chat to send'"
+        :aria-label="messages.actions.confirm"
+        :title="canConfirm ? messages.actions.confirm : messages.actions.openChatToSend"
         :disabled="busy || !canConfirm"
         @click="$emit('action', 'confirm')"
       >
@@ -87,6 +93,9 @@ export type CaptureExportAction = 'save' | 'copy' | 'confirm'
 </script>
 
 <script setup lang="ts">
+import { computed } from 'vue'
+import { defaultCaptureMessages, formatCaptureMessage, type CaptureMessages } from './capture-localization'
+
 interface Props {
   activeTool: CaptureAnnotationTool | null
   color: string
@@ -95,9 +104,12 @@ interface Props {
   canRedo: boolean
   busy: boolean
   canConfirm: boolean
+  messages?: CaptureMessages
 }
 
-defineProps<Props>()
+const props = withDefaults(defineProps<Props>(), {
+  messages: () => defaultCaptureMessages,
+})
 
 defineEmits<{
   tool: [tool: CaptureAnnotationTool]
@@ -109,17 +121,25 @@ defineEmits<{
   cancel: []
 }>()
 
-const tools: ReadonlyArray<{ id: CaptureAnnotationTool; label: string; icon: string }> = [
-  { id: 'rect', label: 'Rectangle', icon: '□' },
-  { id: 'ellipse', label: 'Ellipse', icon: '○' },
-  { id: 'arrow', label: 'Arrow', icon: '↗' },
-  { id: 'brush', label: 'Pen', icon: '⌁' },
-  { id: 'text', label: 'Text', icon: 'T' },
-  { id: 'mosaic', label: 'Mosaic', icon: '▦' },
-]
+const tools = computed<ReadonlyArray<{ id: CaptureAnnotationTool; label: string; icon: string }>>(() => [
+  { id: 'rect', label: props.messages.tools.rectangle, icon: '□' },
+  { id: 'ellipse', label: props.messages.tools.ellipse, icon: '○' },
+  { id: 'arrow', label: props.messages.tools.arrow, icon: '↗' },
+  { id: 'brush', label: props.messages.tools.pen, icon: '⌁' },
+  { id: 'text', label: props.messages.tools.text, icon: 'T' },
+  { id: 'mosaic', label: props.messages.tools.mosaic, icon: '▦' },
+])
 
 const colors = ['#ef4444', '#f97316', '#eab308', '#22c55e', '#3b82f6'] as const
 const strokeWidths = [2, 4, 8] as const
+
+function colorLabel(color: string): string {
+  return formatCaptureMessage(props.messages.a11y.color, { color })
+}
+
+function strokeWidthLabel(width: number): string {
+  return formatCaptureMessage(props.messages.a11y.strokeWidthOption, { width })
+}
 </script>
 
 <style scoped>

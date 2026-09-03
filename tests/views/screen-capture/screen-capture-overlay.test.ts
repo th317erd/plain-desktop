@@ -280,6 +280,7 @@ describe('ScreenCaptureOverlay', () => {
   })
 
   it('passes an exact clipped PNG and frame-pixel selection to retryable callbacks', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {})
     const onExport = vi.fn().mockRejectedValueOnce(new Error('clipboard unavailable')).mockResolvedValueOnce(undefined)
     const { wrapper, stage } = await mountOverlay(onExport)
     await createSelection(stage, { x: 10, y: 15 }, { x: 60, y: 55 })
@@ -289,7 +290,7 @@ describe('ScreenCaptureOverlay', () => {
     await pointer(stage.element, 'pointerup', 40, 35, 41)
 
     await wrapper.get('[data-action="copy"]').trigger('click')
-    await vi.waitFor(() => expect(wrapper.get('[role="alert"]').text()).toContain('clipboard unavailable'))
+    await vi.waitFor(() => expect(wrapper.get('[role="alert"]').text()).toBe('Could not copy the capture. Try again.'))
     expect(wrapper.get('[data-testid="selection-dimensions"]').text()).toBe('50 × 40')
     expect(wrapper.get('[aria-label="Undo"]').attributes()).not.toHaveProperty('disabled')
 

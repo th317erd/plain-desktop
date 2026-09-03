@@ -11,8 +11,8 @@
     @dblclick="onDoubleClick"
     @contextmenu="onContextMenu"
   >
-    <canvas ref="frozenCanvasRef" class="screen-capture-overlay__canvas screen-capture-overlay__source" aria-label="Captured screen" />
-    <canvas ref="canvasRef" class="screen-capture-overlay__canvas screen-capture-overlay__annotations" aria-label="Screen capture annotations" />
+    <canvas ref="frozenCanvasRef" class="screen-capture-overlay__canvas screen-capture-overlay__source" :aria-label="messages.a11y.capturedScreen" />
+    <canvas ref="canvasRef" class="screen-capture-overlay__canvas screen-capture-overlay__annotations" :aria-label="messages.a11y.annotations" />
     <canvas ref="overlayRef" class="screen-capture-overlay__canvas screen-capture-overlay__layer-controls" aria-hidden="true" />
 
     <template v-if="selectionCss">
@@ -25,8 +25,8 @@
           class="screen-capture-overlay__handle"
           :class="`screen-capture-overlay__handle--${handle.name}`"
           :data-handle="handle.name"
-          :aria-label="`Resize selection ${handle.name}`"
-          :title="`Resize selection ${handle.name}`"
+          :aria-label="resizeSelectionLabel(handle.name)"
+          :title="resizeSelectionLabel(handle.name)"
           :style="handle.style"
         />
         <output class="screen-capture-overlay__dimensions" data-testid="selection-dimensions" aria-live="polite">{{ selectionDimensions }}</output>
@@ -41,6 +41,7 @@
           :can-redo="annotation.history.canRedo.value"
           :busy="controlsLocked"
           :can-confirm="canConfirm"
+          :messages="messages"
           @tool="selectTool"
           @color="selectColor"
           @stroke-width="selectStrokeWidth"
@@ -56,7 +57,7 @@
       v-if="annotation.text.draft.value"
       ref="textInputRef"
       class="screen-capture-overlay__text-input"
-      aria-label="Annotation text"
+      :aria-label="messages.a11y.annotationText"
       :style="textInputStyle"
       :value="annotation.text.draft.value.text"
       @pointerdown.stop
@@ -65,6 +66,10 @@
       @input="updateText"
       @keydown="onTextKeyDown"
     />
+
+    <div v-if="busyStatus" class="screen-capture-overlay__status" role="status" aria-live="polite">
+      {{ busyStatus }}
+    </div>
 
     <div v-if="errorMessage" class="screen-capture-overlay__error" role="alert">
       {{ errorMessage }}
@@ -93,6 +98,7 @@ export type ScreenCaptureExportCallback = (action: ToolbarExportAction, payload:
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch, type CSSProperties } from 'vue'
 import { useAnnotationSession } from '@/views/image-editor/composables/useAnnotationSession'
 import { cssPointToFrame, frameRectToCss, selectionToExportRect, type CssViewportRect } from './capture-geometry'
+import { defaultCaptureMessages, formatCaptureMessage, type CaptureMessages } from './capture-localization'
 import { CaptureSelection, handleCenters, placeCaptureToolbar, type FrameBounds, type FramePoint, type SelectionHandle, type SelectionRect } from './selection-model'
 import ScreenCaptureToolbar, { type CaptureAnnotationTool, type CaptureExportAction } from './ScreenCaptureToolbar.vue'
 
@@ -101,9 +107,13 @@ interface Props {
   onExport: (action: CaptureExportAction, payload: CaptureExportPayload) => Promise<void>
   onCancel: () => Promise<void> | void
   canConfirm?: boolean
+  messages?: CaptureMessages
 }
 
-const props = withDefaults(defineProps<Props>(), { canConfirm: true })
+const props = withDefaults(defineProps<Props>(), {
+  canConfirm: true,
+  messages: () => defaultCaptureMessages,
+})
 
 const annotation = useAnnotationSession()
 const { canvasRef, overlayRef, wrapRef } = annotation
@@ -125,6 +135,20 @@ let actionGeneration = 0
 let resizeObserver: ResizeObserver | null = null
 
 const controlsLocked = computed(() => busyAction.value !== null || activePointer.value !== null || annotation.text.draft.value !== null)
+const busyStatus = computed(() => {
+  switch (busyAction.value) {
+    case 'save':
+      return props.messages.status.saving
+    case 'copy':
+      return props.messages.status.copying
+    case 'confirm':
+      return props.messages.status.sending
+    case 'cancel':
+      return props.messages.status.cancelling
+    default:
+      return ''
+  }
+})
 const selectionDimensions = computed(() => {
   const rect = selectionRect.value
   return rect ? `${rect.width} × ${rect.height}` : ''
@@ -366,8 +390,14 @@ function onTextKeyDown(event: KeyboardEvent) {
   }
 }
 
-function friendlyError(error: unknown): string {
-  return error instanceof Error ? error.message : String(error)
+function actionError(action: CaptureExportAction): string {
+  if (action === 'save') return props.messages.errors.saveFailed
+  if (action === 'copy') return props.messages.errors.copyFailed
+  return props.messages.errors.sendFailed
+}
+
+function resizeSelectionLabel(handle: SelectionHandle): string {
+  return formatCaptureMessage(props.messages.a11y.resizeSelection, { handle })
 }
 
 async function performAction(action: CaptureExportAction) {
@@ -381,11 +411,12 @@ async function performAction(action: CaptureExportAction) {
   try {
     const exportRect = selectionToExportRect(rect, frameBounds)
     const rendered = await annotation.exportOps.renderPng(exportRect)
-    if (!rendered.ok) throw new Error(`Unable to export capture (${rendered.error})`)
+    if (!rendered.ok) throw new Error(`capture_export_failed:${rendered.error}`)
     await props.onExport(action, { png: rendered.value, selection: exportRect })
     if (!disposed && generation === actionGeneration) errorMessage.value = ''
   } catch (error) {
-    if (!disposed && generation === actionGeneration) errorMessage.value = friendlyError(error)
+    console.warn('screen capture action failed', error)
+    if (!disposed && generation === actionGeneration) errorMessage.value = actionError(action)
   } finally {
     if (!disposed && generation === actionGeneration) busyAction.value = null
   }
@@ -399,7 +430,8 @@ async function cancelCapture() {
   try {
     await props.onCancel()
   } catch (error) {
-    if (!disposed && generation === actionGeneration) errorMessage.value = friendlyError(error)
+    console.warn('screen capture cancellation failed', error)
+    if (!disposed && generation === actionGeneration) errorMessage.value = props.messages.errors.cancelFailed
   } finally {
     if (!disposed && generation === actionGeneration) busyAction.value = null
   }
@@ -627,6 +659,7 @@ defineExpose<ScreenCaptureOverlayHandle>({ awaitPaint, dispose })
   outline: none;
 }
 
+.screen-capture-overlay__status,
 .screen-capture-overlay__error {
   position: absolute;
   right: 16px;
@@ -638,8 +671,17 @@ defineExpose<ScreenCaptureOverlayHandle>({ awaitPaint, dispose })
   font:
     500 13px/1.4 system-ui,
     sans-serif;
+  border-radius: 6px;
+}
+
+.screen-capture-overlay__status {
+  color: #e2e8f0;
+  background: rgb(17 24 39 / 94%);
+  border: 1px solid #64748b;
+}
+
+.screen-capture-overlay__error {
   background: rgb(127 29 29 / 94%);
   border: 1px solid #f87171;
-  border-radius: 6px;
 }
 </style>
