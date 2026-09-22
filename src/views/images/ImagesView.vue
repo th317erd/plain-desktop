@@ -110,7 +110,7 @@ import { getFileId, getFileUrl, getFileName } from '@/lib/api/file'
 import { formatFileSize } from '@/lib/format'
 import type { IImage, IImageItem } from '@/lib/interfaces'
 import type { ISource } from '@/components/lightbox/types'
-import { DataType, DeviceFeature } from '@/lib/data'
+import { DataType, Capability } from '@/lib/data'
 import { getImageSortItems, getImageGroupByItems, isImage } from '@/lib/file'
 import { hasFeature, hasMediaTrash } from '@/lib/feature'
 import { storeToRefs } from 'pinia'
@@ -180,7 +180,7 @@ const effectiveQ = computed(() => {
 const { loading, fetch } = initLazyQuery({
   handle: async (data: { images: IImage[]; imageCount: number }, error: string) => {
     mp.sorting.value = false
-    if (error) { toast(mp.q.value, 'error') } else if (data) {
+    if (error) { toast(error, 'error') } else if (data) {
       const list = data.images.map((it) => ({ ...it, fileId: getFileId(urlTokenKey.value, it.path, it.id) }))
       if (scrollMode.value && page.value > 1) {
         const existingIds = new Set(items.value.map((i) => i.id))

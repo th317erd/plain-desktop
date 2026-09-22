@@ -17,6 +17,9 @@
 
       <div class="section-title">
         {{ $t('volumes') }}
+        <v-icon-button v-if="hasDiskManager" v-tooltip="$t('disk_manager')" class="sm" @click.stop="openDiskManager">
+          <i-material-symbols:settings-outline-rounded />
+        </v-icon-button>
       </div>
       <div class="volumes">
         <VolumeCard
@@ -59,8 +62,24 @@
 </template>
 
 <script setup lang="ts">
+import { computed } from 'vue'
+import { storeToRefs } from 'pinia'
+import { useTempStore } from '@/stores/temp'
+import { Capability } from '@/lib/data'
+import { hasFeature } from '@/lib/feature'
 import VolumeCard from '@/components/storage/VolumeCard.vue'
+import DiskManagerModal from '@/components/storage/DiskManagerModal.vue'
+import { openModal } from '@/components/modal'
 import { useFilesSidebar } from '@/hooks/files-sidebar'
+
+const { app } = storeToRefs(useTempStore())
+// Disk formatting is served only by backends that declare the DISK_MANAGER
+// capability — the entry keys on app.capabilities, never on the device type.
+const hasDiskManager = computed(() => hasFeature(Capability.DISK_MANAGER, app.value?.capabilities))
+
+function openDiskManager() {
+  openModal(DiskManagerModal)
+}
 
 const {
   quickLinks, volumeLinks, favoriteLinks,

@@ -116,7 +116,7 @@ import { videosGQL, initLazyQuery } from '@/lib/api/query'
 import { getFileId, getFileUrl, getFileExtension, getFileName } from '@/lib/api/file'
 import type { IVideo, IVideoItem } from '@/lib/interfaces'
 import type { ISource } from '@/components/lightbox/types'
-import { DataType, DeviceFeature } from '@/lib/data'
+import { DataType, Capability } from '@/lib/data'
 import { getSortItems, getVideoGroupByItems, isVideo } from '@/lib/file'
 import { hasFeature, hasMediaTrash } from '@/lib/feature'
 import { storeToRefs } from 'pinia'
@@ -187,7 +187,9 @@ const effectiveQ = computed(() => {
 const { loading, fetch } = initLazyQuery({
   handle: async (data: { videos: IVideo[]; videoCount: number }, error: string) => {
     mp.sorting.value = false
-    if (error) { toast(mp.q.value, 'error') } else if (data) {
+    if (error) { 
+      toast(error, 'error') 
+    } else if (data) {
       const raw = data.videos.map((it) => ({ ...it, fileId: getFileId(urlTokenKey.value, it.path, it.id) }))
       if (scrollMode.value && page.value > 1) {
         const existingIds = new Set(items.value.map((i) => i.id))

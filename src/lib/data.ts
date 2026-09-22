@@ -12,8 +12,8 @@ export enum DataType {
   DOC = 'DOC',
 }
 
-// String values match the server's DeviceFeature GraphQL enum items.
-export enum DeviceFeature {
+// String values match the server's Capability GraphQL enum items.
+export enum Capability {
   MEDIA_TRASH = 'MEDIA_TRASH',
   MIRROR_AUDIO = 'MIRROR_AUDIO',
   DOC_PREVIEW = 'DOC_PREVIEW',
@@ -28,4 +28,6 @@ export enum DeviceFeature {
   FEEDS = 'FEEDS',
   SCREEN_MIRROR = 'SCREEN_MIRROR',
   IMAGE_EDITOR = 'IMAGE_EDITOR',
+  LAN_SHARE = 'LAN_SHARE',
+  DISK_MANAGER = 'DISK_MANAGER',
 }

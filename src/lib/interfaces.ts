@@ -466,6 +466,20 @@ export interface IStorageMount {
   alias: string
   driveType: DriveType
   diskId: string
+  /** Partition-only metadata (NAS `mounts` also returns unmounted
+   *  partitions; volumes have no `path` from the server). */
+  partitionNum?: number | null
+  label?: string | null
+  uuid?: string | null
+}
+
+export interface IStorageDisk {
+  id: string
+  name: string
+  path: string
+  sizeBytes: number
+  removable: boolean
+  model: string | null
 }
 
 export interface IHomeStats {
@@ -500,11 +514,17 @@ export interface IImageSearchStatus {
   indexedImages: number
 }
 
+/**
+ * Media-index scan lifecycle (plain-nas `scanProgress.state` and the
+ * `media_scan_progress` WS payload share the same values).
+ */
+export type ScanState = 'IDLE' | 'RUNNING' | 'PAUSED' | 'STOPPED'
+
 export interface IScanProgress {
   indexed: number
   pending: number
   total: number
-  state: string
+  state: ScanState
 }
 
 export interface IApp {
@@ -515,7 +535,7 @@ export interface IApp {
   appDir: string
   deviceName: string
   deviceType: DeviceType
-  features: string[]
+  capabilities: string[]
   channel: AppChannelType
   permissions: string[]
   downloadsDir: string

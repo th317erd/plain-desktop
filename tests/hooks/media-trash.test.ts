@@ -24,9 +24,9 @@ function source(overrides: Partial<ISource> = {}): ISource {
   }
 }
 
-function setFeatures(features: string[]) {
+function setFeatures(capabilities: string[]) {
   const tempStore = useTempStore()
-  tempStore.app = { ...tempStore.app, features }
+  tempStore.app = { ...tempStore.app, capabilities }
 }
 
 beforeEach(() => {
